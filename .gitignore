@@ -1,0 +1,16 @@
+build/
+build_*/
+backup_*/
+log/
+*.o
+*.so
+*.a
+*.log
+.DS_Store
+.vs/
+.vscode/
+*.swp
+compile_commands.json
+run.pid
+*_backup_*.txt
+*.pid

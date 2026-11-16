@@ -1,0 +1,33 @@
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+
+set(M3_GCC_ROOT "/home/sura/project/toolchain/nx_toolchains/nvidia-gcc93")
+set(M3_GCC_PREFIX "${M3_GCC_ROOT}/bin/aarch64-buildroot-linux-gnu-")
+
+foreach(M3_TOOL gcc g++ ar ranlib strip readelf)
+    if(NOT EXISTS "${M3_GCC_PREFIX}${M3_TOOL}")
+        message(FATAL_ERROR "Missing bundled tool: ${M3_GCC_PREFIX}${M3_TOOL}")
+    endif()
+endforeach()
+
+set(CMAKE_C_COMPILER "${M3_GCC_PREFIX}gcc" CACHE FILEPATH "" FORCE)
+set(CMAKE_CXX_COMPILER "${M3_GCC_PREFIX}g++" CACHE FILEPATH "" FORCE)
+set(CMAKE_AR "${M3_GCC_PREFIX}ar" CACHE FILEPATH "" FORCE)
+set(CMAKE_RANLIB "${M3_GCC_PREFIX}ranlib" CACHE FILEPATH "" FORCE)
+set(CMAKE_STRIP "${M3_GCC_PREFIX}strip" CACHE FILEPATH "" FORCE)
+
+execute_process(
+    COMMAND "${CMAKE_C_COMPILER}" -print-sysroot
+    OUTPUT_VARIABLE M3_SYSROOT OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE M3_SYSROOT_RESULT)
+if(NOT M3_SYSROOT_RESULT EQUAL 0 OR NOT IS_DIRECTORY "${M3_SYSROOT}")
+    message(FATAL_ERROR "Invalid sysroot from bundled compiler: ${M3_SYSROOT}")
+endif()
+message(STATUS "Cross-compiler sysroot: ${M3_SYSROOT}")
+
+set(CMAKE_SYSROOT "${M3_SYSROOT}" CACHE PATH "" FORCE)
+set(CMAKE_FIND_ROOT_PATH "${M3_SYSROOT}")
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
