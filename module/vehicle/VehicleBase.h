@@ -87,6 +87,14 @@ class VehicleBase {
   virtual int64_t QueryDroneYaw(float32_t &yawDeg) = 0;
   // 查询 RTK 定位解状态(50=窄区固定解), 见 E_DjiFcSubscriptionPositionSolutionProperty
   virtual int64_t QueryRtkSolution(uint8_t &solution) = 0;
+  // 查询负载网络 RTK 机载服务状态(见 E_DjiNetworkRtkOnboardState: 2=DJI_TRANSFER 传输中)。
+  // 默认实现返回 -1 表示"该机型/该 RTK 源不提供此状态", 子类可重写。
+  // 注意: 若 RTK 源是遥控器或 D-RTK2 而非负载自带网络 RTK, 此状态可能恒为非传输态,
+  // 因此默认仅作诊断上报, 只有配置 track_require_network_rtk=true 时才作硬门控。
+  virtual int64_t QueryNetworkRtkState(uint8_t &state) {
+    (void)state;
+    return -1;
+  }
   // 查询飞机类型
   int QueryAircraftType(void) { return aircraftType_; }
 

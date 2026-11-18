@@ -37,7 +37,7 @@ int64_t PipelineM3Gimbal::Init(void) {
   }
   // 初始化 MOP 命令服务端 (接收 App 端指令)
   mopCmd_ = new MopCommandServer;
-  if (mopCmd_->Init(gimbal_, flight_)) {
+  if (mopCmd_->Init(gimbal_, flight_, track_)) {
     MAICRO_ERROR("mop cmd server init error");
     // 不阻止启动, widget 仍可用
   }
@@ -62,6 +62,12 @@ void PipelineM3Gimbal::DeInit(void) {
     flight_->DeInit();
     delete flight_;
     flight_ = nullptr;
+  }
+  // track_ 被 flight_ 与 mopCmd_ 引用, 必须在两者都释放之后再删,
+  // 否则它们的工作线程可能访问已析构的存储(悬空指针)
+  if (track_) {
+    delete track_;
+    track_ = nullptr;
   }
   if (gimbal_) {
     gimbal_->DeInit();
@@ -113,8 +119,31 @@ int64_t PipelineM3Gimbal::InitFlight(void) {
   flightConf.moveDistance = conf_->moveDistance;
   flightConf.autoConfirmLanding = conf_->autoConfirmLanding;
 
+  // 航迹执行参数
+  flightConf.trackMinSatellites = (uint16_t)conf_->trackMinSatellites;
+  flightConf.trackPointTimeoutS = (uint32_t)conf_->trackPointTimeoutS;
+  flightConf.trackArriveTolerance = conf_->trackArriveTolerance;
+  flightConf.trackGimbalSettleMs = (uint32_t)conf_->trackGimbalSettleMs;
+  flightConf.trackAltCrossCheckM = conf_->trackAltCrossCheckM;
+  flightConf.trackRequireNetworkRtk = conf_->trackRequireNetworkRtk;
+  flightConf.trackStopOnRtkLoss = conf_->trackStopOnRtkLoss;
+
+  // 航迹存储: 先于 flight_ 创建, 因为 flight_ 与 mopCmd_ 都持有它的指针。
+  // Init 失败(目录不可建)不阻止服务启动 —— 云台/飞行按键仍可用,
+  // 只是航迹命令会回 ERROR:io, 不静默丢数据。
+  track_ = new TrackStore;
+  if (track_->Init(conf_->trackDir) != 0) {
+    MAICRO_ERROR("track store init failed (dir=%s), track feature disabled",
+                 conf_->trackDir.c_str());
+  }
+
   flight_ = new FlightController;
-  return flight_->Init(vehicle_, flightConf);
+  int64_t ret = flight_->Init(vehicle_, flightConf);
+  // 注入航迹存储与主云台挂载位置(航迹回放转云台用; mountPos 是 VehicleBase
+  // 的 protected 成员, FlightController 无法经指针访问, 故在此显式注入)
+  flight_->SetTrackStore(track_);
+  flight_->SetGimbalMountPos((E_MaicroMountPosition)conf_->gimbalMountPos);
+  return ret;
 }
 
 int64_t PipelineM3Gimbal::InitWidget(void) {

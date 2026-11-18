@@ -45,6 +45,22 @@ int ConfM3Gimbal::ParseConfFile(const std::string &filePath) {
   // 控件配置
   widgetCfgDir = GetStringPara("Widget Info", "widget_cfg_dir", "widget_cfg");
 
+  // 航迹配置. 全部带默认值: [Track Info] 段缺失时用默认值继续启动,
+  // 只打 ERROR 日志(ConfBase 既有行为), 不让服务起不来。
+  trackDir = GetStringPara("Track Info", "track_dir", "track");
+  trackMinSatellites = GetIntPara("Track Info", "track_min_satellites", 10);
+  trackPointTimeoutS = GetIntPara("Track Info", "track_point_timeout_s", 120);
+  trackArriveTolerance =
+      GetFloatPara("Track Info", "track_arrive_tolerance", 2.0f);
+  trackGimbalSettleMs = GetIntPara("Track Info", "track_gimbal_settle_ms", 3000);
+  trackAltCrossCheckM =
+      GetFloatPara("Track Info", "track_alt_crosscheck_m", 10.0f);
+  trackMaxPoints = GetIntPara("Track Info", "track_max_points", 200);
+  trackRequireNetworkRtk =
+      GetBoolPara("Track Info", "track_require_network_rtk", false);
+  trackStopOnRtkLoss =
+      GetBoolPara("Track Info", "track_stop_on_rtk_loss", false);
+
   if (userAppName.empty() || userAppID.empty() || userAppKey.empty() ||
       userAppLicense.empty() || userDeveloperAccount.empty()) {
     MAICRO_ERROR("[User Info] incomplete, check %s", filePath.c_str());

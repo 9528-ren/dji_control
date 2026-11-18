@@ -37,6 +37,17 @@ class ConfM3Gimbal : public ConfBase {
   // 控件配置
   std::string widgetCfgDir;
 
+  // 航迹配置(全部有默认值, 老配置文件不加 [Track Info] 段也能正常启动)
+  std::string trackDir;          // 航迹文件存储目录(相对运行目录)
+  int trackMinSatellites;        // 采点/执行要求的最小可见卫星数
+  int trackPointTimeoutS;        // 单点飞行基础超时(秒)
+  float trackArriveTolerance;    // 到位判定容差(m), 超 3 倍则中止整条航迹
+  int trackGimbalSettleMs;       // 云台转到目标俯仰的等待上限(ms)
+  float trackAltCrossCheckM;     // 椭球高交叉校验容差(m)
+  int trackMaxPoints;            // 单条航迹最大航点数(仅日志提示, 上限由 TrackStore 强制)
+  bool trackRequireNetworkRtk;   // 是否额外要求负载网络RTK处于传输态
+  bool trackStopOnRtkLoss;       // 掉解时是否用最后可信坐标强制停住
+
  private:
   double GetDoublePara(const std::string &s_type, const std::string &key_words,
                        double init_val);

@@ -4,6 +4,7 @@
 
 #include "VehicleBase.h"
 #include "dji_flight_controller.h"
+#include "dji_network_rtk.h"
 #include "dji_typedef.h"
 
 namespace maicro {
@@ -61,6 +62,18 @@ class VehicleDjiPsdk : public VehicleBase {
   int64_t QueryDroneYaw(float32_t &yawDeg);
   int64_t QueryRtkSolution(uint8_t &solution);
 
+  /**
+   * 负载网络 RTK 机载服务状态(见 E_DjiNetworkRtkOnboardState, 2=DJI_TRANSFER 传输中)。
+   * 返回 -1 表示"从未收到回调上报", 即该机型不带负载网络RTK 或 RTK 源在别处
+   * (遥控器/D-RTK2)。调用方不得把 -1 当作 RTK 故障。
+   */
+  int64_t QueryNetworkRtkState(uint8_t &state) {
+    uint8_t v = s_netRtkState.load();
+    if (v == kNetRtkUnknown) return -1;
+    state = v;
+    return 0;
+  }
+
  private:
   /*******************************************************
    * 内部回调
@@ -72,6 +85,9 @@ class VehicleDjiPsdk : public VehicleBase {
   // 飞往指定点任务状态回调
   static T_DjiReturnCode FlyToMissionInfoCallback(
       T_DjiFlightControllerOpenMis eventData);
+
+  // 负载网络 RTK 状态回调(只写原子量, 不做任何阻塞操作)
+  static void NetworkRtkStateCallback(E_DjiNetworkRtkOnboardState state);
 
   // 挂载位置转换
   static E_DjiMountPosition MountPositionConvert(
@@ -94,5 +110,9 @@ class VehicleDjiPsdk : public VehicleBase {
 
   static std::atomic<uint8_t> s_flyToMissionState;
   static std::atomic<float32_t> s_flyToRemainDistance;
+
+  /** "从未收到网络RTK状态上报"的哨兵值(E_DjiNetworkRtkOnboardState 合法值为 0~6) */
+  static const uint8_t kNetRtkUnknown = 0xFF;
+  static std::atomic<uint8_t> s_netRtkState;
 };
 }  // namespace maicro

@@ -17,6 +17,16 @@
 namespace maicro {
 std::atomic<uint8_t> VehicleDjiPsdk::s_flyToMissionState(0);
 std::atomic<float32_t> VehicleDjiPsdk::s_flyToRemainDistance(0);
+// 0xFF = 从未收到上报(哨兵), 语义同 kNetRtkUnknown;
+// 这里用字面量而非引用该常量, 避免静态常量被 ODR-use 而缺类外定义导致链接失败。
+std::atomic<uint8_t> VehicleDjiPsdk::s_netRtkState(0xFF);
+
+void VehicleDjiPsdk::NetworkRtkStateCallback(
+    E_DjiNetworkRtkOnboardState state) {
+  // 回调运行在 SDK 收发线程, 只写原子量, 不做任何阻塞操作
+  s_netRtkState.store((uint8_t)state);
+  MAICRO_INFO("network rtk onboard state -> %d (2=transfer)", (int)state);
+}
 
 template <typename T>
 static int64_t GetTopicValue(E_DjiFcSubscriptionTopic topic, T &value) {
@@ -464,6 +474,22 @@ int64_t VehicleDjiPsdk::InitVehicleModule(void) {
     MAICRO_ERROR("Register fly to mission info callback failed, "
                  "error code:0x%08llX",
                  returnCode);
+  }
+
+  // 负载网络 RTK 状态回调: 仅用于诊断上报(RTK 命令回显)与可选硬门控。
+  // 注册失败或机型不支持都不影响主流程 —— RTK 解状态(sol==50 固定解)才是权威判据,
+  // 且若 RTK 源在遥控器/D-RTK2 而非负载自带网络RTK, 此回调可能永不触发,
+  // 此时 s_netRtkState 保持哨兵值, QueryNetworkRtkState 返回 -1(不可用而非故障)。
+  returnCode = DjiNetworkRtk_RegReceiveNetworkRtkStateCallback(
+      NetworkRtkStateCallback);
+  if (returnCode == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+    MAICRO_INFO("network rtk state callback registered");
+  } else if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_NONSUPPORT) {
+    MAICRO_WARN("register network rtk state callback failed, code 0x%08llX "
+                "(diagnostic only, ignored)",
+                returnCode);
+  } else {
+    MAICRO_INFO("network rtk not supported on this model (diagnostic only)");
   }
 
   return 0;
