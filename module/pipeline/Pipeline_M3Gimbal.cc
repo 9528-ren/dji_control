@@ -42,13 +42,15 @@ int64_t PipelineM3Gimbal::Init(void) {
     // 不阻止启动, widget 仍可用
   }
 
-  MAICRO_INFO("pipeline init ok, waiting for Pilot widget input / MOP commands");
+  MAICRO_INFO(
+      "pipeline init ok, waiting for Pilot widget input / MOP commands");
   return 0;
 }
 
 void PipelineM3Gimbal::DeInit(void) {
   // 释放顺序: 先切断命令来源(控件/MOP 线程), 再释放被它们引用的
-  // flight_/gimbal_, 否则这些线程可能在对象已 delete 后仍调用 PostCmd (悬空指针)
+  // flight_/gimbal_, 否则这些线程可能在对象已 delete 后仍调用 PostCmd
+  // (悬空指针)
   if (widget_) {
     delete widget_;
     widget_ = nullptr;
@@ -104,7 +106,9 @@ int64_t PipelineM3Gimbal::InitVehicle(void) {
 
 int64_t PipelineM3Gimbal::InitGimbal(void) {
   gimbal_ = new GimbalController;
-  return gimbal_->Init(vehicle_, (E_MaicroMountPosition)conf_->gimbalMountPos,
+  // 挂载口取自 vehicle_ 的探测结果而非直接照抄 conf_->gimbalMountPos:
+  // 配置为 0 时代表"自动探测", 该原始值对云台控制器没有意义
+  return gimbal_->Init(vehicle_, vehicle_->QueryGimbalMountPos(),
                        conf_->pitchStep, conf_->rotateTime);
 }
 
@@ -140,9 +144,10 @@ int64_t PipelineM3Gimbal::InitFlight(void) {
   flight_ = new FlightController;
   int64_t ret = flight_->Init(vehicle_, flightConf);
   // 注入航迹存储与主云台挂载位置(航迹回放转云台用; mountPos 是 VehicleBase
-  // 的 protected 成员, FlightController 无法经指针访问, 故在此显式注入)
+  // 的 protected 成员, FlightController 无法经指针访问, 故在此显式注入)。
+  // 注入探测结果而非配置原值: 配置为 0 表示自动探测, 原值不可直接使用
   flight_->SetTrackStore(track_);
-  flight_->SetGimbalMountPos((E_MaicroMountPosition)conf_->gimbalMountPos);
+  flight_->SetGimbalMountPos(vehicle_->QueryGimbalMountPos());
   return ret;
 }
 
@@ -150,4 +155,4 @@ int64_t PipelineM3Gimbal::InitWidget(void) {
   widget_ = new WidgetHandler;
   return widget_->Init(conf_->widgetCfgDir, gimbal_, flight_);
 }
-}  // namespace maicro
+} // namespace maicro

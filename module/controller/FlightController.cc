@@ -11,6 +11,27 @@ namespace maicro {
 // 离地高度低于该值时视为触发降落保护, 需确认降落(参考 PSDK 官方 sample)
 #define LANDING_CONFIRM_HEIGHT 0.7f
 
+// 起飞目标高度: 飞控自动起飞只到约 1.2m, 且爬升速度由固件固定。
+// 起飞后由本程序接手速度控制继续爬到该高度, 满足"起飞更快、停稳在 3m"的要求。
+constexpr float kTakeoffHeightM = 3.0f;
+constexpr float kTakeoffClimbSpeedMps = 4.0f;
+constexpr float kTakeoffHeightTolM = 0.15f;
+
+// 返航: 先原地把机头转向起飞点, 再平飞到位, 停稳 1s 后垂直降落。
+// 到位判据比旧的 1m/3m 收紧, 否则"判到位→立刻降落"必然把 1~3m 的水平误差
+// 直接变成落点偏差。
+constexpr double kHomeArriveTolRtkM = 0.35;
+constexpr double kHomeArriveTolGpsM = 1.2;
+constexpr double kHomeApproachGain = 0.5;        // 速度 = 距离 x 0.5
+constexpr double kHomeMinApproachSpeedMps = 0.3; // 末段最低速度, 避免停住不走
+constexpr double kHomeMaxSpeedMps = 3.0;
+constexpr int kHomeSettleCycles = 10;            // 100ms x 10 = 到位后稳定 1s
+constexpr int kHomeYawCycles = 100;              // 100ms x 100 = 转向 10s 上限
+constexpr float kHomeYawTolDeg = 5.0f;
+constexpr float kHomeYawRateGain = 1.5f;
+constexpr float kHomeYawRateMinDegps = 10.0f;    // 低于该角速率飞控可能不响应
+constexpr float kHomeYawRateMaxDegps = 30.0f;
+
 FlightController::FlightController() {}
 
 FlightController::~FlightController() { DeInit(); }
@@ -37,6 +58,12 @@ const char *FlightController::CmdName(FlightCmd cmd) {
       return "GO_HOME_RTK";
     case FlightCmd::TRACK_RUN:
       return "TRACK_RUN";
+    case FlightCmd::VOICE_PREPARE:
+      return "VOICE_PREPARE";
+    case FlightCmd::VOICE_ASCEND:
+      return "VOICE_ASCEND";
+    case FlightCmd::VOICE_DEPART:
+      return "VOICE_DEPART";
     default:
       return "NONE";
   }
@@ -65,7 +92,17 @@ int64_t FlightController::Init(VehicleBase *vehicle, const S_FlightConf &conf) {
 void FlightController::DeInit(void) { worker_.Stop(); }
 
 void FlightController::PostCmd(FlightCmd cmd) {
-  int oldCmd = worker_.Post((int)cmd);
+  std::lock_guard<std::mutex> lock(voiceMutex_);
+  ++voiceGeneration_;
+  if (voiceStatus_.stage != VoiceFlightStage::IDLE &&
+      voiceStatus_.stage != VoiceFlightStage::COMPLETE &&
+      voiceStatus_.stage != VoiceFlightStage::FAILED) {
+    voiceStatus_.stage = VoiceFlightStage::FAILED;
+    voiceStatus_.detail = "interrupted";
+    voiceCommand_ = FlightCmd::NONE;
+    PublishVoiceStatus(voiceStatus_);
+  }
+  int oldCmd = worker_.Post((int)cmd, voiceGeneration_);
   if (oldCmd) {
     MAICRO_WARN("flight cmd %s not executed yet, replaced by %s",
                 CmdName((FlightCmd)oldCmd), CmdName(cmd));
@@ -73,7 +110,17 @@ void FlightController::PostCmd(FlightCmd cmd) {
 }
 
 void FlightController::Execute(int cmd) {
+  {
+    std::lock_guard<std::mutex> lock(voiceMutex_);
+    if (worker_.ExecutingToken() != voiceGeneration_) return;
+  }
   MAICRO_INFO("flight cmd %s start", CmdName((FlightCmd)cmd));
+  const auto flightCmd = static_cast<FlightCmd>(cmd);
+  if (flightCmd == FlightCmd::VOICE_PREPARE || flightCmd == FlightCmd::VOICE_ASCEND ||
+      flightCmd == FlightCmd::VOICE_DEPART) {
+    ExecuteVoiceFlight(flightCmd);
+    return;
+  }
   if (!vehicle_->IsFlightCtrlReady()) {
     Notify("飞控模块未初始化, 无法执行");
     return;
@@ -112,7 +159,7 @@ void FlightController::Execute(int cmd) {
               ok ? "ok" : "failed/interrupted");
 }
 
-bool FlightController::DoTakeoff(void) {
+bool FlightController::DoTakeoff(bool *controlObtained, bool climbToTargetHeight) {
   if (GetStatus() == MAICRO_FLIGHT_STATUS_IN_AIR) {
     Notify("飞机已在空中, 忽略起飞");
     return false;
@@ -155,6 +202,10 @@ bool FlightController::DoTakeoff(void) {
     Notify("起飞失败: 获取控制权失败");
     return false;
   }
+  if (controlObtained) {
+    *controlObtained = true;
+    if (worker_.HasPending()) return false;
+  }
   if (vehicle_->FlightControlTakeoff()) {
     Notify("起飞失败: 飞控拒绝起飞");
     return false;
@@ -191,8 +242,31 @@ bool FlightController::DoTakeoff(void) {
     }
   }
 
+  // 续爬升: 自动起飞仅到约 1.2m, 这里用速度控制继续爬到 3m (2.5m/s),
+  // 速度按剩余高度比例收敛, 到 0.15m 容差内松杆悬停。
+  // 失败只影响这段续爬, 飞机仍在空中悬停, 不改变"起飞成功"的结论。
   float32_t height = 0;
-  vehicle_->QueryDroneRelativeHeight(height);
+  if (climbToTargetHeight && vehicle_->QueryDroneRelativeHeight(height) == 0 &&
+      height < kTakeoffHeightM - kTakeoffHeightTolM) {
+    MAICRO_INFO("takeoff climb: %.2f m -> %.2f m, cap %.1f m/s", height,
+                kTakeoffHeightM, kTakeoffClimbSpeedMps);
+    if (vehicle_->SetVelocityControlGround() == 0) {
+      for (int i = 0; i < 300; ++i) {  // 100ms x 300 = 30s 上限
+        if (vehicle_->QueryDroneRelativeHeight(height) != 0) break;
+        const float32_t err = kTakeoffHeightM - height;
+        if (fabsf(err) <= kTakeoffHeightTolM) break;
+        float32_t vz = err * 3.0f;
+        if (vz > kTakeoffClimbSpeedMps) vz = kTakeoffClimbSpeedMps;
+        else if (vz < -kTakeoffClimbSpeedMps) vz = -kTakeoffClimbSpeedMps;
+        if (vehicle_->FeedVoiceFlightVelocityVector(0, 0, vz, 0) != 0) break;
+        if (!worker_.SleepMs(100)) break;
+      }
+      vehicle_->FeedVoiceFlightVelocityVector(0, 0, 0, 0);
+      vehicle_->QueryDroneRelativeHeight(height);
+    } else {
+      MAICRO_WARN("takeoff climb skipped: velocity control unavailable");
+    }
+  }
   Notify("起飞完成, 相对高度 %.1f m", height);
   return true;
 }
@@ -321,7 +395,8 @@ bool FlightController::DoGoHome(void) {
   // 否则会因定位噪声永远判不到位而空转到超时。
   uint8_t sol = 0;
   const bool rtkFixed = QueryRtkFixed(sol);
-  const double arriveTol2D = rtkFixed ? 1.0 : 3.0;
+  // 定位质量只决定"到位判据松紧": RTK 0.35m, 仅 GPS 1.2m。
+  const double arriveTol2D = rtkFixed ? kHomeArriveTolRtkM : kHomeArriveTolGpsM;
   if (!rtkFixed) {
     Notify("RTK 非固定解(状态 %u), 按 GPS 精度返航, 落点误差可能数米", sol);
   }
@@ -353,36 +428,81 @@ bool FlightController::DoGoHome(void) {
   bool ctrlFailed = false;
   bool arrived = false;
   bool interrupted = false;
+
+  // ---- 阶段 1: 原地把机头转向起飞点(只转航向, 不平移) ----
+  // 旧实现全程不下发航向指令, 飞机保持离场时的机头朝向横着/倒着飞回来,
+  // 看起来就不是"沿原路返回"。这里先对准起飞点再走直线。
+  if (dist > arriveTol2D) {
+    const double R = 6378137.0;
+    const double dNorth = (homePos_.latitude - currPos.latitude) * R * M_PI / 180.0;
+    const double dEast = (homePos_.longitude - currPos.longitude) * R * M_PI / 180.0 *
+                         cos(currPos.latitude * M_PI / 180.0);
+    const double bearing = atan2(dEast, dNorth) * 180.0 / M_PI;  // 0=正北, 90=正东
+    MAICRO_INFO("go home: bearing to home %.1f deg, yawing nose to home",
+                bearing);
+    for (int i = 0; i < kHomeYawCycles; ++i) {
+      if (worker_.HasPending()) {
+        interrupted = true;
+        break;
+      }
+      float32_t yaw = 0;
+      if (vehicle_->QueryDroneYaw(yaw)) break;
+      double err = bearing - (double)yaw;
+      while (err > 180.0) err -= 360.0;
+      while (err < -180.0) err += 360.0;
+      if (fabs(err) <= kHomeYawTolDeg) break;
+      float32_t rate = (float32_t)(err * kHomeYawRateGain);
+      if (rate > kHomeYawRateMaxDegps) rate = kHomeYawRateMaxDegps;
+      else if (rate < -kHomeYawRateMaxDegps) rate = -kHomeYawRateMaxDegps;
+      if (rate > 0.0f && rate < kHomeYawRateMinDegps) rate = kHomeYawRateMinDegps;
+      else if (rate < 0.0f && rate > -kHomeYawRateMinDegps) rate = -kHomeYawRateMinDegps;
+      if (vehicle_->FeedVelocityVector(0, 0, 0, rate)) {
+        ctrlFailed = true;
+        MAICRO_ERROR("go home: yaw command rejected");
+        break;
+      }
+      if (!worker_.SleepMs(100)) {
+        interrupted = true;
+        break;
+      }
+    }
+    vehicle_->FeedVelocityVector(0, 0, 0, 0);
+  }
+
+  // ---- 阶段 2: 平飞回起飞点上方, 速度随距离收敛 ----
+  // 旧实现 5m 内把速度从 3m/s 阶跃到 1m/s, 冲过起飞点再刹停, 落点因此偏出 1m 以上。
+  // 现在速度 = 距离 x 0.5 (0.3~3m/s), 接近时自然减速; 进入容差后还要稳定 1s。
+  int settled = 0;
   int cycles = 0;
   const int maxCycles = 3600;  // 100ms x 3600 = 6min 上限
-  while (cycles++ < maxCycles) {
+  while (!ctrlFailed && !interrupted && cycles++ < maxCycles) {
     if (vehicle_->QueryDronePosition(currPos)) break;
 
     const double R = 6378137.0;
-    double dNorth = (homePos_.latitude - currPos.latitude) * R * M_PI / 180.0;
-    double dEast = (homePos_.longitude - currPos.longitude) * R * M_PI / 180.0 *
-                   cos(currPos.latitude * M_PI / 180.0);
+    const double dNorth = (homePos_.latitude - currPos.latitude) * R * M_PI / 180.0;
+    const double dEast = (homePos_.longitude - currPos.longitude) * R * M_PI / 180.0 *
+                         cos(currPos.latitude * M_PI / 180.0);
     dist = sqrt(dNorth * dNorth + dEast * dEast);
 
     if (dist <= arriveTol2D) {
-      arrived = true;
-      break;
+      vehicle_->FeedVelocityVector(0, 0, 0, 0);
+      if (++settled >= kHomeSettleCycles) {
+        arrived = true;
+        break;
+      }
+      if (!worker_.SleepMs(100)) {
+        interrupted = true;
+        break;
+      }
+      continue;
     }
+    settled = 0;
 
-    // 误差即速度指令, 越近越慢(自动减速), 但**永不为零** ——
-    // 旧实现在 dist<2.0 时把水平速度清零, 而到位判据是 dist<1.0,
-    // 于是飞机停在 1~2m 之间既不移动也判不到位, 必然空转到超时。
-    //
-    // 限幅必须**对称**: dNorth/dEast 可正可负(南/西方向为负), 只夹正方向会让
-    // 负方向直接透传原始误差值(如 -10), 使"接近减速"对一半方向失效。
-    // FeedVelocityVector 内部虽有 ±3 兜底, 但近场 1m/s 的减速意图会被破坏。
-    const float32_t vLimit = (dist < 5.0) ? 1.0f : 3.0f;
-    float32_t vN = (float32_t)dNorth;
-    if (vN > vLimit) vN = vLimit;
-    else if (vN < -vLimit) vN = -vLimit;
-    float32_t vE = (float32_t)dEast;
-    if (vE > vLimit) vE = vLimit;
-    else if (vE < -vLimit) vE = -vLimit;
+    double speed = dist * kHomeApproachGain;
+    if (speed < kHomeMinApproachSpeedMps) speed = kHomeMinApproachSpeedMps;
+    if (speed > kHomeMaxSpeedMps) speed = kHomeMaxSpeedMps;
+    const float32_t vN = (float32_t)(dNorth / dist * speed);
+    const float32_t vE = (float32_t)(dEast / dist * speed);
     // 垂直方向保持当前高度: 不在返航途中下降, 避免撞上起飞点与飞机之间的障碍;
     // 降落交给到位之后的 FlightControlLanding 垂直下降。
     if (vehicle_->FeedVelocityVector(vN, vE, 0, 0)) {
@@ -430,7 +550,7 @@ bool FlightController::DoGoHome(void) {
   if (vehicle_->QueryDronePosition(currPos) == 0) {
     double dev = HorizontalDistance(currPos.latitude, currPos.longitude,
                                     homePos_.latitude, homePos_.longitude);
-    if (dev > arriveTol2D * 3) {
+    if (dev > arriveTol2D * 2) {
       vehicle_->StopFlightControl();
       Notify("返航异常: 距起飞点仍 %.1f m, 已悬停不降落", dev);
       return false;

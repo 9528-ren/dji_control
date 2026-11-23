@@ -21,20 +21,38 @@ void TaskWorker::Stop(void) {
     std::lock_guard<std::mutex> lck(mutex_);
     if (!running_) return;
     running_ = false;
+    pendingCmd_ = 0;
   }
   cond_.notify_all();
   if (thread_.joinable()) thread_.join();
 }
 
-int TaskWorker::Post(int cmd) {
+int TaskWorker::Post(int cmd, uint64_t token) {
   int oldCmd;
   {
     std::lock_guard<std::mutex> lck(mutex_);
     oldCmd = pendingCmd_;
     pendingCmd_ = cmd;
+    pendingToken_ = token;
   }
   cond_.notify_all();
   return oldCmd;
+}
+
+bool TaskWorker::PostIfIdle(int cmd, uint64_t token) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!running_ || pendingCmd_ != 0 || executing_) return false;
+    pendingCmd_ = cmd;
+    pendingToken_ = token;
+  }
+  cond_.notify_one();
+  return true;
+}
+
+uint64_t TaskWorker::ExecutingToken() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return executingToken_;
 }
 
 bool TaskWorker::HasPending(void) {
@@ -57,9 +75,15 @@ void TaskWorker::Loop(void) {
       cond_.wait(lck, [this] { return !running_ || pendingCmd_ != 0; });
       if (!running_) break;
       cmd = pendingCmd_;
+      executingToken_ = pendingToken_;
       pendingCmd_ = 0;
+      executing_ = true;
     }
     handler_(cmd);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      executing_ = false;
+    }
   }
   MAICRO_INFO("%s worker thread exit", name_.c_str());
 }

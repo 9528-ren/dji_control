@@ -4,6 +4,8 @@
 #include "controller/TrackStore.h"
 #include "dji_mop_channel.h"
 #include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -44,6 +46,16 @@ private:
   /** 处理 TRK,<rid>,<VERB>[,<arg>...] 形式的航迹命令 */
   void HandleTrackCommand(const std::string &cmd);
 
+  /**
+   * 处理 UPG,<VERB>[,args] 形式的分片升级命令。
+   *
+   * 与飞行/航迹完全隔离: 响应行统一 "UPG," 前缀, 不影响指令 ACK 语义。
+   * 数据落到 kUpgradeDir 下的 staging 文件, UPG,END 校验通过后由
+   * upgrade::CommitPending 落成 pending, 下次启动自动替换并 exec。
+   */
+  void HandleUpgradeCommand(const std::string &cmd);
+  void CloseUpgradeFile();
+
   GimbalController *gimbal_ = nullptr;
   FlightController *flight_ = nullptr;
   TrackStore *track_ = nullptr;
@@ -53,5 +65,15 @@ private:
 
   std::deque<std::string> sendQueue_;
   std::mutex sendMutex_;
+  std::condition_variable sendCond_;
+
+  // ---- 分片升级状态(只在 MOP 收包线程读写, 无需加锁) ----
+  int upgFd_ = -1;
+  uint64_t upgSize_ = 0;      // 目标文件总字节
+  uint64_t upgChunk_ = 0;     // 每片原始字节数
+  uint64_t upgSeqTotal_ = 0;  // 总分片数
+  uint64_t upgSeenCount_ = 0; // 已收到(去重后)的分片数
+  std::string upgMd5_;        // 期望 MD5
+  std::vector<uint8_t> upgSeen_; // 分片到达位图
 };
 } // namespace maicro

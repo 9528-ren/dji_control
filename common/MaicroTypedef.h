@@ -5,11 +5,17 @@ typedef float float32_t;
 typedef double float64_t;
 
 typedef enum {
+  // 0 表示"自动探测": 由载荷启动时逐口查询相机连接状态, 找出真正的大疆相机云台
+  // 所在口(见 VehicleDjiPsdk::DetectGimbalMountPos)。探测不到则关闭云台功能,
+  // 不再向不存在的模块发指令。手动填 1~5 可强制指定, 用于探测误判时兜底。
   MAICRO_MOUNT_POSITION_UNKNOWN = 0,
   MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO1 = 1,
   MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO2 = 2,
   MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO3 = 3,
   MAICRO_MOUNT_POSITION_EXTENSION_PORT = 4,
+  // E4 口。注意 DJI 侧对应的是 EXTENSION_PORT_V2_NO4(值 4), 与上面
+  // EXTENSION_PORT(值 8)不是同一个东西, 故本枚举另开一个值避免冲突
+  MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO4 = 5,
 } E_MaicroMountPosition;
 
 typedef enum {

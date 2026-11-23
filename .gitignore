@@ -1,5 +1,6 @@
 build/
 build_*/
+build-cross/
 backup_*/
 log/
 *.o
@@ -12,5 +13,10 @@ log/
 *.swp
 compile_commands.json
 run.pid
-*_backup_*.txt
 *.pid
+*_backup_*.txt
+*.bak_sync_*
+*.bak
+*.bak.*
+3rd_party/Payload-SDK-*/
+.m3_upgrade/

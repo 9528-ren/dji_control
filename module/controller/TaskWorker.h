@@ -23,7 +23,11 @@ class TaskWorker {
   void Stop(void);
 
   // 投递命令(线程安全, 非阻塞), 返回被覆盖的旧命令, 0 表示没有
-  int Post(int cmd);
+  int Post(int cmd, uint64_t token = 0);
+
+  bool PostIfIdle(int cmd, uint64_t token = 0);
+
+  uint64_t ExecutingToken();
 
   // 是否有待执行的新命令(执行中的长任务可据此中断)
   bool HasPending(void);
@@ -41,6 +45,9 @@ class TaskWorker {
   std::mutex mutex_;
   std::condition_variable cond_;
   int pendingCmd_ = 0;
+  uint64_t pendingToken_ = 0;
+  uint64_t executingToken_ = 0;
+  bool executing_ = false;
   bool running_ = false;
 };
 }  // namespace maicro

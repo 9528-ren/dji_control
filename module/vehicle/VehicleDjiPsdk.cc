@@ -1,11 +1,17 @@
+#include <algorithm>
+#include <cmath>
 #include "VehicleDjiPsdk.h"
 
 #include <math.h>
 #include <string.h>
 
+#include <chrono>
+#include <mutex>
+
 #include "MaicroLogger.inl"
 #include "conf/ConfM3Gimbal.h"
 #include "dji_aircraft_info.h"
+#include "dji_camera_manager.h"
 #include "dji_core.h"
 #include "dji_fc_subscription.h"
 #include "dji_gimbal_manager.h"
@@ -15,6 +21,66 @@
 #define DEG2RAD(x) ((x) * M_PI / 180.0)
 
 namespace maicro {
+namespace {
+using VoiceClock = std::chrono::steady_clock;
+
+template <class T> struct VoiceTopic {
+  T data{};
+  T_DjiDataTimestamp timestamp{};
+  VoiceClock::time_point received{};
+
+  bool Fresh(VoiceClock::time_point now) const {
+    return received != VoiceClock::time_point{} &&
+           now - received <= std::chrono::milliseconds(600);
+  }
+};
+
+std::mutex voiceTelemetryMutex;
+VoiceTopic<T_DjiFcSubscriptionFlightStatus> voiceFlight;
+VoiceTopic<T_DjiFcSubscriptionDisplaymode> voiceMode;
+VoiceTopic<T_DjiFcSubscriptionPositionFused> voicePosition;
+VoiceTopic<T_DjiFcSubscriptionAltitudeFused> voiceAltitude;
+VoiceTopic<T_DjiFcSubscriptionQuaternion> voiceAttitude;
+uint32_t voiceLandings = 0;
+std::atomic<uint32_t> voiceControlLosses{0};
+
+template <class T>
+bool StoreVoiceTopic(VoiceTopic<T> &slot, const uint8_t *data, uint16_t bytes,
+                     const T_DjiDataTimestamp *timestamp) {
+  if (!data || !timestamp || bytes < sizeof(T))
+    return false;
+  if (slot.received != VoiceClock::time_point{} &&
+      slot.timestamp.millisecond == timestamp->millisecond &&
+      slot.timestamp.microsecond == timestamp->microsecond)
+    return false;
+  memcpy(&slot.data, data, sizeof(T)); // 兼容 SDK 末尾带对齐填充的数据
+  slot.received = VoiceClock::now();
+  slot.timestamp = *timestamp;
+  return true;
+}
+
+template <class T, VoiceTopic<T> *Slot>
+T_DjiReturnCode OnVoiceTopic(const uint8_t *data, uint16_t bytes,
+                             const T_DjiDataTimestamp *timestamp) {
+  std::lock_guard<std::mutex> lock(voiceTelemetryMutex);
+  StoreVoiceTopic(*Slot, data, bytes, timestamp);
+  return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+
+T_DjiReturnCode OnVoiceFlight(const uint8_t *data, uint16_t bytes,
+                              const T_DjiDataTimestamp *timestamp) {
+  std::lock_guard<std::mutex> lock(voiceTelemetryMutex);
+  auto previous = voiceFlight.data;
+  if (StoreVoiceTopic(voiceFlight, data, bytes, timestamp) &&
+      previous == MAICRO_FLIGHT_STATUS_IN_AIR &&
+      (voiceFlight.data == MAICRO_FLIGHT_STATUS_ON_GROUND ||
+       voiceFlight.data == MAICRO_FLIGHT_STATUS_STOPED)) {
+    ++voiceLandings;
+  }
+  return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
+}
+} // namespace
+
 std::atomic<uint8_t> VehicleDjiPsdk::s_flyToMissionState(0);
 std::atomic<float32_t> VehicleDjiPsdk::s_flyToRemainDistance(0);
 // 0xFF = 从未收到上报(哨兵), 语义同 kNetRtkUnknown;
@@ -53,6 +119,44 @@ int64_t VehicleDjiPsdk::InitVehicleObject(const ConfM3Gimbal *conf) {
     return -1;
   }
   MAICRO_INFO("Init vehicle psdk success...");
+
+  // 云台探测必须在 DjiCore 初始化之后: 之前调用 DjiCameraManager_Init 必然返回
+  // 未初始化错误(0xEE), 会把确实挂着相机的机型(如 M4E)误判成"无相机"并永久关掉云台。
+  //
+  // gimbal_mount_pos=0 -> 自动探测(推荐): 换机身/换插口都无需改配置。
+  // 手动指定 1~5 -> 尊重配置, 但仍探测一次确认相机在位, 避免向空口发指令。
+  if (mainCameraMountPos_ == MAICRO_MOUNT_POSITION_UNKNOWN) {
+    MAICRO_INFO("gimbal_mount_pos=0, auto-detecting camera gimbal port...");
+    mainCameraMountPos_ = DetectGimbalMountPos();
+    gimbalAvailable_ = (mainCameraMountPos_ != MAICRO_MOUNT_POSITION_UNKNOWN);
+  } else {
+    MAICRO_INFO("gimbal_mount_pos=%d (manually configured), verifying camera "
+                "presence...",
+                (int)mainCameraMountPos_);
+    E_MaicroMountPosition detected = DetectGimbalMountPos();
+    if (detected == mainCameraMountPos_) {
+      gimbalAvailable_ = true;
+    } else if (detected != MAICRO_MOUNT_POSITION_UNKNOWN) {
+      MAICRO_WARN("gimbal_mount_pos configured as %d but camera detected on "
+                  "enum %d; using detected value",
+                  (int)mainCameraMountPos_, (int)detected);
+      mainCameraMountPos_ = detected;
+      gimbalAvailable_ = true;
+    } else if (gimbalProbeInconclusive_) {
+      // 探测本身失败(相机管理模块初始化失败), 结果不可信: 手动配置的挂载口照常启用,
+      // 否则 M4E 这类确实有相机的机型会因探测失败而永久失去云台控制。
+      MAICRO_WARN("gimbal probe inconclusive, trusting configured mount pos %d",
+                  (int)mainCameraMountPos_);
+      gimbalAvailable_ = true;
+    } else {
+      MAICRO_WARN("gimbal_mount_pos configured as %d but no camera gimbal "
+                  "detected on any port; gimbal control disabled",
+                  (int)mainCameraMountPos_);
+      gimbalAvailable_ = false;
+    }
+  }
+  MAICRO_INFO("gimbal mount pos = %d, gimbal available = %s",
+              (int)mainCameraMountPos_, gimbalAvailable_ ? "yes" : "no");
 
   if (InitVehicleModule()) {
     MAICRO_ERROR("Init vehicle module failed...");
@@ -99,8 +203,29 @@ void VehicleDjiPsdk::DeInitVehicleObject(void) {
 
 /*******************************************************
  * 云台控制
+ * 前置条件: gimbalAvailable_ 为真(自动探测到相机, 或配置手动指定且在位)。
+ * 机身没挂相机时直接返回失败并只警告一次, 避免每次按键都刷
+ * 0x000000E1(模块不存在)错误日志, 也避免调用方误以为操作已生效。
  *******************************************************/
+bool VehicleDjiPsdk::EnsureGimbalAvailable(const char *op) {
+  if (gimbalAvailable_)
+    return true;
+  if (!gimbalNoCameraWarned_) {
+    gimbalNoCameraWarned_ = true;
+    MAICRO_WARN("no DJI camera gimbal present (probe found none); gimbal "
+                "control disabled, first caller was %s. Flight control "
+                "(takeoff/landing/move/go-home/track) is unaffected.",
+                op ? op : "unknown");
+  } else {
+    MAICRO_DEBUG("gimbal %s skipped: no camera gimbal present",
+                 op ? op : "unknown");
+  }
+  return false;
+}
+
 int64_t VehicleDjiPsdk::ResetGimbal(E_MaicroMountPosition pos) {
+  if (!EnsureGimbalAvailable("recenter"))
+    return -1;
   return DjiGimbalManager_Reset(MountPositionConvert(pos),
                                 DJI_GIMBAL_RESET_MODE_PITCH_AND_YAW);
 }
@@ -108,6 +233,8 @@ int64_t VehicleDjiPsdk::ResetGimbal(E_MaicroMountPosition pos) {
 int64_t VehicleDjiPsdk::RotateGimbal(E_MaicroMountPosition pos, float32_t pitch,
                                      float32_t roll, float32_t yaw,
                                      float64_t time, bool isRelative) {
+  if (!EnsureGimbalAvailable("rotate"))
+    return -1;
   T_DjiGimbalManagerRotation dji_rotation;
   memset(&dji_rotation, 0, sizeof(dji_rotation));
   dji_rotation.pitch = pitch;
@@ -122,6 +249,8 @@ int64_t VehicleDjiPsdk::RotateGimbal(E_MaicroMountPosition pos, float32_t pitch,
 
 int64_t VehicleDjiPsdk::SetGimbalMode(E_MaicroMountPosition pos,
                                       E_MaicroGimbalMode gimbalMode) {
+  if (!EnsureGimbalAvailable("set mode"))
+    return -1;
   T_DjiReturnCode returnCode = DjiGimbalManager_SetMode(
       MountPositionConvert(pos), (E_DjiGimbalMode)gimbalMode);
   if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
@@ -134,7 +263,8 @@ int64_t VehicleDjiPsdk::SetGimbalMode(E_MaicroMountPosition pos,
  * 飞行控制
  *******************************************************/
 int64_t VehicleDjiPsdk::StartFlightControl(void) {
-  T_DjiReturnCode returnCode = DjiFlightController_ObtainJoystickCtrlAuthority();
+  T_DjiReturnCode returnCode =
+      DjiFlightController_ObtainJoystickCtrlAuthority();
   if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
     MAICRO_ERROR("Obtain joystick authority failed, error code: 0x%08llX",
                  returnCode);
@@ -203,7 +333,7 @@ int64_t VehicleDjiPsdk::FlyToPosition(const S_MaicroPosition &target,
   memset(&rsp, 0, sizeof(rsp));
 
   req.version = 1;
-  req.operation = 0;  // 新任务
+  req.operation = 0; // 新任务
   req.mea = minEnrouteHeight;
   req.fly_vel = speed;
   req.goal_num = 1;
@@ -217,7 +347,8 @@ int64_t VehicleDjiPsdk::FlyToPosition(const S_MaicroPosition &target,
               target.latitude, target.longitude, target.altitude,
               minEnrouteHeight, speed);
 
-  T_DjiReturnCode returnCode = DjiFlightController_SetModeStartMission(req, &rsp);
+  T_DjiReturnCode returnCode =
+      DjiFlightController_SetModeStartMission(req, &rsp);
   if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
     MAICRO_ERROR("start fly to mission failed, error code: 0x%08llX",
                  returnCode);
@@ -272,7 +403,7 @@ int64_t VehicleDjiPsdk::FeedVelocityVector(float32_t x, float32_t y,
   float32_t rateYaw = fabs(yaw) < 30 ? yaw : (yaw > 0 ? 30 : -30);
 
   T_DjiFlightControllerJoystickCommand joystickCommand = {speedX, speedY,
-                                                           speedZ, rateYaw};
+                                                          speedZ, rateYaw};
   returnCode = DjiFlightController_ExecuteJoystickAction(joystickCommand);
   if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
     MAICRO_DEBUG("execute joy stick action failed, error code: 0x%08X",
@@ -281,6 +412,23 @@ int64_t VehicleDjiPsdk::FeedVelocityVector(float32_t x, float32_t y,
   }
 
   return 0;
+}
+
+int64_t VehicleDjiPsdk::FeedVoiceFlightVelocityVector(
+    float32_t x, float32_t y, float32_t z, float32_t yaw) {
+  if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+      !std::isfinite(yaw)) return -1;
+  const double horizontal = std::hypot(x, y);
+  if (horizontal > 4.0) {
+    const double scale = 4.0 / horizontal;
+    x *= scale;
+    y *= scale;
+  }
+  z = std::max(-5.0f, std::min(5.0f, z));
+  yaw = std::max(-30.0f, std::min(30.0f, yaw));
+  T_DjiFlightControllerJoystickCommand command = {x, y, z, yaw};
+  const T_DjiReturnCode result = DjiFlightController_ExecuteJoystickAction(command);
+  return result == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS ? 0 : -1;
 }
 
 /*******************************************************
@@ -359,12 +507,43 @@ int64_t VehicleDjiPsdk::QueryDroneYaw(float32_t &yawDeg) {
     return -1;
   }
   double q2sqr = (double)quat.q2 * quat.q2;
-  double t0 = -2.0 * ((double)quat.q2 * quat.q2 + (double)quat.q3 * quat.q3) + 1.0;
+  double t0 =
+      -2.0 * ((double)quat.q2 * quat.q2 + (double)quat.q3 * quat.q3) + 1.0;
   double t1 = 2.0 * ((double)quat.q1 * quat.q2 + (double)quat.q0 * quat.q3);
   double yawRad = atan2(t1, t0);
   yawDeg = (float32_t)(RAD2DEG(yawRad));
-  if (yawDeg < 0) yawDeg += 360.0f;
+  if (yawDeg < 0)
+    yawDeg += 360.0f;
   return 0;
+}
+
+bool VehicleDjiPsdk::ReadVoiceFlightTelemetry(VoiceFlightTelemetry &out) {
+  std::lock_guard<std::mutex> lock(voiceTelemetryMutex);
+  const auto now = VoiceClock::now();
+  if (!voiceFlight.Fresh(now) || !voiceMode.Fresh(now) ||
+      !voicePosition.Fresh(now) || !voiceAltitude.Fresh(now) ||
+      !voiceAttitude.Fresh(now))
+    return false;
+
+  const auto q = voiceAttitude.data;
+  const double norm = q.q0 * q.q0 + q.q1 * q.q1 + q.q2 * q.q2 + q.q3 * q.q3;
+  if (!std::isfinite(norm) || norm < 0.8 || norm > 1.2)
+    return false;
+  const double x = 1.0 - 2.0 * (q.q2 * q.q2 + q.q3 * q.q3);
+  const double y = 2.0 * (q.q1 * q.q2 + q.q0 * q.q3);
+  out.yawDeg = static_cast<float32_t>(RAD2DEG(atan2(y, x)));
+  out.status = static_cast<E_MaicroFlightStatus>(voiceFlight.data);
+  out.displayMode = voiceMode.data;
+  const auto pos = voicePosition.data;
+  out.position = {RAD2DEG(pos.longitude), RAD2DEG(pos.latitude), pos.altitude,
+                  pos.visibleSatelliteNumber};
+  out.altitude = voiceAltitude.data;
+  out.landings = voiceLandings;
+  return true;
+}
+
+uint32_t VehicleDjiPsdk::VoiceControlLossCount() const {
+  return voiceControlLosses.load();
 }
 
 int64_t VehicleDjiPsdk::QueryRtkSolution(uint8_t &solution) {
@@ -477,11 +656,12 @@ int64_t VehicleDjiPsdk::InitVehicleModule(void) {
   }
 
   // 负载网络 RTK 状态回调: 仅用于诊断上报(RTK 命令回显)与可选硬门控。
-  // 注册失败或机型不支持都不影响主流程 —— RTK 解状态(sol==50 固定解)才是权威判据,
-  // 且若 RTK 源在遥控器/D-RTK2 而非负载自带网络RTK, 此回调可能永不触发,
-  // 此时 s_netRtkState 保持哨兵值, QueryNetworkRtkState 返回 -1(不可用而非故障)。
-  returnCode = DjiNetworkRtk_RegReceiveNetworkRtkStateCallback(
-      NetworkRtkStateCallback);
+  // 注册失败或机型不支持都不影响主流程 —— RTK 解状态(sol==50
+  // 固定解)才是权威判据, 且若 RTK 源在遥控器/D-RTK2 而非负载自带网络RTK,
+  // 此回调可能永不触发, 此时 s_netRtkState 保持哨兵值, QueryNetworkRtkState
+  // 返回 -1(不可用而非故障)。
+  returnCode =
+      DjiNetworkRtk_RegReceiveNetworkRtkStateCallback(NetworkRtkStateCallback);
   if (returnCode == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
     MAICRO_INFO("network rtk state callback registered");
   } else if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_NONSUPPORT) {
@@ -502,25 +682,30 @@ int64_t VehicleDjiPsdk::InitVehicleSubscription(void) {
     E_DjiDataSubscriptionTopicFreq freq;
     const char *name;
     bool required;
+    DjiReceiveDataOfTopicCallback callback = nullptr;
   } topics[] = {
       {DJI_FC_SUBSCRIPTION_TOPIC_STATUS_FLIGHT,
-       DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "flight status", true},
+       DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "flight status", true, OnVoiceFlight},
       {DJI_FC_SUBSCRIPTION_TOPIC_STATUS_DISPLAYMODE,
-       DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "display mode", true},
+       DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "display mode", true,
+       OnVoiceTopic<T_DjiFcSubscriptionDisplaymode, &voiceMode>},
       {DJI_FC_SUBSCRIPTION_TOPIC_HEIGHT_FUSION,
        DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "height fusion", true},
       {DJI_FC_SUBSCRIPTION_TOPIC_POSITION_FUSED,
-       DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "position fused", true},
+       DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "position fused", true,
+       OnVoiceTopic<T_DjiFcSubscriptionPositionFused, &voicePosition>},
       {DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_FUSED,
-       DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "altitude fused", true},
+       DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "altitude fused", true,
+       OnVoiceTopic<T_DjiFcSubscriptionAltitudeFused, &voiceAltitude>},
       {DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_OF_HOMEPOINT,
        DJI_DATA_SUBSCRIPTION_TOPIC_1_HZ, "altitude of home point", true},
       // 云台角度话题只支持 50Hz
       {DJI_FC_SUBSCRIPTION_TOPIC_GIMBAL_ANGLES,
        DJI_DATA_SUBSCRIPTION_TOPIC_50_HZ, "gimbal angles", false},
       // 机头航向(四元数), 方向平移按键计算目标点用; 订阅失败时按键会提示重试
-      {DJI_FC_SUBSCRIPTION_TOPIC_QUATERNION,
-       DJI_DATA_SUBSCRIPTION_TOPIC_50_HZ, "quaternion", false},
+      {DJI_FC_SUBSCRIPTION_TOPIC_QUATERNION, DJI_DATA_SUBSCRIPTION_TOPIC_50_HZ,
+       "quaternion", false,
+       OnVoiceTopic<T_DjiFcSubscriptionQuaternion, &voiceAttitude>},
       // RTK 定位解状态, RTK返航按键校验用; 无RTK的机型订阅失败不影响其他功能
       {DJI_FC_SUBSCRIPTION_TOPIC_RTK_POSITION_INFO,
        DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "rtk position info", false},
@@ -528,14 +713,22 @@ int64_t VehicleDjiPsdk::InitVehicleSubscription(void) {
 
   int64_t ret = 0;
   for (auto &t : topics) {
+    // 机身没有相机云台时订阅云台角度必然失败(0x000000E1 模块不存在),
+    // 直接跳过并说明原因, 避免启动日志里出现看似故障的红色错误
+    if (!gimbalAvailable_ &&
+        t.topic == DJI_FC_SUBSCRIPTION_TOPIC_GIMBAL_ANGLES) {
+      MAICRO_INFO("skip subscribing %s: no camera gimbal present", t.name);
+      continue;
+    }
     T_DjiReturnCode returnCode =
-        DjiFcSubscription_SubscribeTopic(t.topic, t.freq, NULL);
+        DjiFcSubscription_SubscribeTopic(t.topic, t.freq, t.callback);
     if (returnCode == DJI_ERROR_SUBSCRIPTION_MODULE_CODE_TOPIC_DUPLICATE) {
       MAICRO_WARN("Subscribe topic %s duplicate", t.name);
     } else if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
       MAICRO_ERROR("Subscribe topic %s failed, error code: 0x%08llX", t.name,
                    returnCode);
-      if (t.required) ret = -1;
+      if (t.required)
+        ret = -1;
     } else {
       MAICRO_INFO("Subscribe topic %s success", t.name);
     }
@@ -546,24 +739,29 @@ int64_t VehicleDjiPsdk::InitVehicleSubscription(void) {
 /*******************************************************
  * 内部回调
  *******************************************************/
-T_DjiReturnCode VehicleDjiPsdk::FlightControlJoystickCtrlAuthSwitchEventCallback(
+T_DjiReturnCode
+VehicleDjiPsdk::FlightControlJoystickCtrlAuthSwitchEventCallback(
     T_DjiFlightControllerJoystickCtrlAuthorityEventInfo eventData) {
+  if (eventData.curJoystickCtrlAuthority !=
+      DJI_FLIGHT_CONTROLLER_JOYSTICK_CTRL_AUTHORITY_OSDK) {
+    voiceControlLosses.fetch_add(1);
+  }
   const char *owner = "unknown";
   switch (eventData.curJoystickCtrlAuthority) {
-    case DJI_FLIGHT_CONTROLLER_JOYSTICK_CTRL_AUTHORITY_RC:
-      owner = "RC";
-      break;
-    case DJI_FLIGHT_CONTROLLER_JOYSTICK_CTRL_AUTHORITY_MSDK:
-      owner = "MSDK";
-      break;
-    case DJI_FLIGHT_CONTROLLER_JOYSTICK_CTRL_AUTHORITY_INTERNAL:
-      owner = "INTERNAL";
-      break;
-    case DJI_FLIGHT_CONTROLLER_JOYSTICK_CTRL_AUTHORITY_OSDK:
-      owner = "PSDK";
-      break;
-    default:
-      break;
+  case DJI_FLIGHT_CONTROLLER_JOYSTICK_CTRL_AUTHORITY_RC:
+    owner = "RC";
+    break;
+  case DJI_FLIGHT_CONTROLLER_JOYSTICK_CTRL_AUTHORITY_MSDK:
+    owner = "MSDK";
+    break;
+  case DJI_FLIGHT_CONTROLLER_JOYSTICK_CTRL_AUTHORITY_INTERNAL:
+    owner = "INTERNAL";
+    break;
+  case DJI_FLIGHT_CONTROLLER_JOYSTICK_CTRL_AUTHORITY_OSDK:
+    owner = "PSDK";
+    break;
+  default:
+    break;
   }
   MAICRO_INFO("[Event] joystick ctrl authority -> %s, switch event: %d", owner,
               (int)eventData.joystickCtrlAuthoritySwitchEvent);
@@ -576,27 +774,115 @@ T_DjiReturnCode VehicleDjiPsdk::FlyToMissionInfoCallback(
   s_flyToMissionState = eventData.mission_state_machine;
   s_flyToRemainDistance = eventData.distance_remaining;
   if (lastState != eventData.mission_state_machine) {
-    MAICRO_INFO("[Event] fly to mission state %u -> %u, remain distance %.1f m, "
-                "remain time %.1f s",
-                lastState, eventData.mission_state_machine,
-                eventData.distance_remaining, eventData.time_remaining);
+    MAICRO_INFO(
+        "[Event] fly to mission state %u -> %u, remain distance %.1f m, "
+        "remain time %.1f s",
+        lastState, eventData.mission_state_machine,
+        eventData.distance_remaining, eventData.time_remaining);
   }
   return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
-E_DjiMountPosition VehicleDjiPsdk::MountPositionConvert(
-    E_MaicroMountPosition position) {
+E_DjiMountPosition
+VehicleDjiPsdk::MountPositionConvert(E_MaicroMountPosition position) {
   switch (position) {
-    case MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO1:
-      return DJI_MOUNT_POSITION_PAYLOAD_PORT_NO1;
-    case MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO2:
-      return DJI_MOUNT_POSITION_PAYLOAD_PORT_NO2;
-    case MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO3:
-      return DJI_MOUNT_POSITION_PAYLOAD_PORT_NO3;
-    case MAICRO_MOUNT_POSITION_EXTENSION_PORT:
-      return DJI_MOUNT_POSITION_EXTENSION_PORT;
-    default:
-      return DJI_MOUNT_POSITION_UNKNOWN;
+  case MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO1:
+    return DJI_MOUNT_POSITION_PAYLOAD_PORT_NO1;
+  case MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO2:
+    return DJI_MOUNT_POSITION_PAYLOAD_PORT_NO2;
+  case MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO3:
+    return DJI_MOUNT_POSITION_PAYLOAD_PORT_NO3;
+  // E4: 必须映射到 EXTENSION_PORT_V2_NO4(值 4) 不是 EXTENSION_PORT(值 8)。
+  // dji_fts.h 注明 M400 的 FTS 仅支持 EXTENSION_PORT_V2_NO4 也印证 M400
+  // 的扩展口按 V2_NO 系列编号
+  case MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO4:
+    return DJI_MOUNT_POSITION_EXTENSION_PORT_V2_NO4;
+  case MAICRO_MOUNT_POSITION_EXTENSION_PORT:
+    return DJI_MOUNT_POSITION_EXTENSION_PORT;
+  default:
+    return DJI_MOUNT_POSITION_UNKNOWN;
   }
 }
-}  // namespace maicro
+
+E_MaicroMountPosition VehicleDjiPsdk::DetectGimbalMountPos(void) {
+  static const struct {
+    E_MaicroMountPosition maicroPos;
+    E_DjiMountPosition djiPos;
+    const char *label;
+  } kCandidates[] = {
+      {MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO1,
+       DJI_MOUNT_POSITION_PAYLOAD_PORT_NO1, "E1"},
+      {MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO2,
+       DJI_MOUNT_POSITION_PAYLOAD_PORT_NO2, "E2"},
+      {MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO3,
+       DJI_MOUNT_POSITION_PAYLOAD_PORT_NO3, "E3"},
+      {MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO4,
+       DJI_MOUNT_POSITION_EXTENSION_PORT_V2_NO4, "E4"},
+  };
+
+  T_DjiReturnCode ret = DjiCameraManager_Init();
+  gimbalProbeInconclusive_ = false;
+  bool camMgrReady = (ret == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS);
+  if (!camMgrReady) {
+    // 未初始化成功时内部句柄为空, 继续调用 GetCameraConnectStatus 会段错误
+    gimbalProbeInconclusive_ = true;
+    MAICRO_WARN("camera manager init failed 0x%08llX, skip gimbal probe",
+                (unsigned long long)ret);
+    return MAICRO_MOUNT_POSITION_UNKNOWN;
+  }
+
+  E_MaicroMountPosition found = MAICRO_MOUNT_POSITION_UNKNOWN;
+  for (const auto &c : kCandidates) {
+    bool connected = false;
+    T_DjiReturnCode rc =
+        DjiCameraManager_GetCameraConnectStatus(c.djiPos, &connected);
+    if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+      MAICRO_DEBUG("probe %s: connect status query rc=0x%08llX (not present)",
+                   c.label, (unsigned long long)rc);
+      continue;
+    }
+    if (!connected) {
+      MAICRO_DEBUG("probe %s: not connected", c.label);
+      continue;
+    }
+
+    E_DjiCameraType camType = DJI_CAMERA_TYPE_UNKNOWN;
+    T_DjiReturnCode tc = DjiCameraManager_GetCameraType(c.djiPos, &camType);
+    MAICRO_INFO("probe %s: connected camera type=%d (rc=0x%08llX)", c.label,
+                (int)camType, (unsigned long long)tc);
+    if (tc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS &&
+        camType == DJI_CAMERA_TYPE_PSDK) {
+      MAICRO_INFO("probe %s: skipped, this is our own PSDK payload (not a "
+                  "camera gimbal)",
+                  c.label);
+      continue;
+    }
+    if (camType == DJI_CAMERA_TYPE_UNKNOWN) {
+      MAICRO_WARN("probe %s: connected but camera type unknown, accepting as "
+                  "gimbal candidate",
+                  c.label);
+    }
+    found = c.maicroPos;
+    break;
+  }
+
+  if (found == MAICRO_MOUNT_POSITION_UNKNOWN) {
+    MAICRO_INFO("gimbal probe: no DJI camera gimbal found on E1~E4");
+  } else {
+    const char *label = "?";
+    if (found == MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO1)
+      label = "E1";
+    else if (found == MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO2)
+      label = "E2";
+    else if (found == MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO3)
+      label = "E3";
+    else if (found == MAICRO_MOUNT_POSITION_PAYLOAD_PORT_NO4)
+      label = "E4";
+    MAICRO_INFO("gimbal probe: camera gimbal detected on %s (enum value %d)",
+                label, (int)found);
+  }
+  if (camMgrReady)
+    DjiCameraManager_DeInit();
+  return found;
+}
+} // namespace maicro

@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <deque>
 #include <mutex>
 #include <string>
 
@@ -22,6 +23,26 @@ enum class FlightCmd {
   MOVE_RIGHT,     // 机头右侧平移
   GO_HOME_RTK,    // RTK固定解时按起飞点RTK坐标飞回并降落
   TRACK_RUN,      // 执行已保存的航迹(逐点串行飞)
+  VOICE_PREPARE,
+  VOICE_ASCEND,
+  VOICE_DEPART,
+};
+
+enum class VoiceFlightStage {
+  IDLE,
+  PREPARING,
+  PREPARED,
+  ASCENDING,
+  READY,
+  DEPARTING,
+  COMPLETE,
+  FAILED,
+};
+
+struct VoiceFlightStatus {
+  VoiceFlightStage stage = VoiceFlightStage::IDLE;
+  std::string request;
+  const char *detail = "-";
 };
 
 /** 航迹执行状态机(供 App 轮询 STAT 与 EVT 推送) */
@@ -96,6 +117,11 @@ class FlightController {
 
   static const char *CmdName(FlightCmd cmd);
 
+  const char *RequestVoiceFlight(FlightCmd cmd, const std::string &request,
+                                 VoiceFlightStatus &out, bool latest = false);
+  VoiceFlightStatus GetVoiceFlightStatus();
+  static const char *VoiceStageName(VoiceFlightStage stage);
+
   // ==================== 航迹功能 ====================
 
   /** 注入航迹存储(由 Pipeline 在 Init 之后调用, 生命周期长于本对象) */
@@ -158,7 +184,13 @@ class FlightController {
 
  private:
   void Execute(int cmd);
-  bool DoTakeoff(void);
+  bool DoTakeoff(bool *controlObtained = nullptr, bool climbToTargetHeight = true);
+  void ExecuteVoiceFlight(FlightCmd cmd);
+  const char *DoVoiceFlight(FlightCmd cmd, uint32_t landings);
+  const char *MoveVoiceFlight(const VoiceFlightTelemetry &origin, double north,
+                              double east, double up, float32_t speed,
+                              uint32_t controlLossCount, bool passThrough = false);
+  void PublishVoiceStatus(const VoiceFlightStatus &status);
   bool DoLanding(void);
   bool DoFlyToTarget(void);
   // 返航: 按起飞时记录的起飞点坐标, 用地面坐标系(NEU)速度闭环飞回, **确认水平到位后**
@@ -204,6 +236,13 @@ class FlightController {
   // 起飞成功时记录的位置(RTK融合坐标), RTK返航的目的地
   S_MaicroPosition homePos_;
   bool homePosValid_ = false;
+
+  std::mutex voiceMutex_;
+  VoiceFlightStatus voiceStatus_;
+  FlightCmd voiceCommand_ = FlightCmd::NONE;
+  uint32_t voiceRoundLandings_ = 0;
+  uint64_t voiceGeneration_ = 0;
+  std::deque<std::string> voiceRecentRequests_;
 
   // ---- 航迹执行状态 ----
   TrackStore *track_ = nullptr;

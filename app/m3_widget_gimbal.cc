@@ -7,6 +7,7 @@
 #include <string>
 
 #include "MaicroLogger.inl"
+#include "mop/SelfUpgrade.h"
 #include "pipeline/Pipeline_M3Gimbal.h"
 #include "version.h"
 
@@ -48,6 +49,10 @@ int main(int argc, char *argv[]) {
 
   initLog(logFile);
   raiseFdLimit();
+
+  // 若 App 已上传完新程序(UPG,END 成功), 在这里替换自身并 exec 新程序:
+  // 遥控器上点"重启无人机" -> 本程序重新启动 -> 应用更新, 全程不需要登录设备。
+  maicro::upgrade::ApplyPendingAndExec(argc, argv);
 
   signal(SIGINT, handleSig);
   signal(SIGTERM, handleSig);
