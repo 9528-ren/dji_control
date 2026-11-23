@@ -1489,16 +1489,31 @@ const char *FlightController::RequestVoiceFlight(FlightCmd cmd,
     const std::string &request, VoiceFlightStatus &out, bool latest) {
   // generation 必须由本类分配: 按键 PostCmd 也递增同一个计数,
   // 两边共用才能正确抢占。业务模块只使用不自增。
+  //
+  // **令牌必须在调用脚本之前就提交**: VoiceFlightScript::Request 内部会
+  // worker_.Post(cmd, generation) 把命令放行给飞行执行线程, 而 Execute()
+  // 开头要校验 worker_.ExecutingToken() == voiceGeneration_。
+  // 若等 Request 返回后才写 voiceGeneration_, 执行线程可能已经取走命令并
+  // 看到旧令牌, 于是静默 return —— 表现为只发 PREPARING 事件却永远不执行
+  // (2026-11-23 M4E 实测: voice accepted generation=13 之后无 flight cmd start)。
+  // 原实现整段在同一把 voiceMutex_ 内, 拆分成两个类后该原子性一度丢失。
+  // 这里先占号, 失败再回滚, 保证"令牌先立, 命令后放"。
   uint64_t generation;
+  uint64_t previous;
   {
     std::lock_guard<std::mutex> lock(voiceMutex_);
-    generation = voiceGeneration_ + 1;
+    previous = voiceGeneration_;
+    generation = previous + 1;
+    voiceGeneration_ = generation;
   }
   const char *err = voiceScript_.Request(static_cast<int>(cmd), request, out,
                                          latest, generation);
-  if (!err) {
+  if (err) {
+    // 回滚: 仅当期间没有别的按键/语音推进过令牌时才退回, 否则会误抹新令牌。
     std::lock_guard<std::mutex> lock(voiceMutex_);
-    voiceGeneration_ = generation;
+    if (voiceGeneration_ == generation) {
+      voiceGeneration_ = previous;
+    }
   }
   return err;
 }

@@ -190,19 +190,40 @@ const char *VoiceFlightScript::Request(int cmd, const std::string &request,
 
   // generation 由 FlightController 统一分配(按键 PostCmd 也递增同一个计数),
   // 本模块只使用不自增, 否则两套令牌会错位导致抢占失效。
-  if (latest) {
-    ctx_->Worker().Post(cmd, generation);
-    recentRequests_.push_back(request);
-    if (recentRequests_.size() > 64) recentRequests_.pop_front();
-  } else if (!ctx_->Worker().PostIfIdle(cmd, generation)) {
-    return "busy";
-  }
+  //
+  // **状态必须先落定, 再放行命令**: Post/PostIfIdle 一旦成功, 飞行执行线程
+  // 随时可能进入 Execute(), 而它要校验 generation_ / command_ / status_.stage。
+  // 若先 Post 后赋值, 执行线程会看到上一轮的旧值而静默 return, 表现为
+  // 只发 PREPARING 却永不执行(2026-11-23 M4E 实测)。
+  // PostIfIdle 失败(busy)时不能留下已改的状态, 故先暂存旧值以便回滚。
+  const uint64_t prevGeneration = generation_;
+  const uint32_t prevLandings = roundLandings_;
+  const int prevCommand = command_;
+  const VoiceFlightStatus prevStatus = status_;
+
   generation_ = generation;
   roundLandings_ = sample.landingCount;
-  MAICRO_INFO("voice accepted id=%s command=%s generation=%llu latest=%d",
-              request.c_str(), CmdLabel(cmd), (unsigned long long)generation, latest ? 1 : 0);
   command_ = cmd;
   status_ = {next, request, "-"};
+
+  bool posted = false;
+  if (latest) {
+    ctx_->Worker().Post(cmd, generation);
+    posted = true;
+    recentRequests_.push_back(request);
+    if (recentRequests_.size() > 64) recentRequests_.pop_front();
+  } else {
+    posted = ctx_->Worker().PostIfIdle(cmd, generation);
+  }
+  if (!posted) {
+    generation_ = prevGeneration;
+    roundLandings_ = prevLandings;
+    command_ = prevCommand;
+    status_ = prevStatus;
+    return "busy";
+  }
+  MAICRO_INFO("voice accepted id=%s command=%s generation=%llu latest=%d",
+              request.c_str(), CmdLabel(cmd), (unsigned long long)generation, latest ? 1 : 0);
   out = status_;
   Publish(out);
   return nullptr;
