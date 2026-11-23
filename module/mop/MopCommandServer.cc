@@ -20,9 +20,19 @@ const char kHeartbeatText[] = "HB\n";
 const uint32_t kMaxConsecutiveRecvErr = 100;
 
 const size_t kMaxSendQueue = 1024;
+
+// 飞行 ACK 专用队列上限。人手点击级频率, 正常绝不会堆积;
+// 堆到这个量说明链路异常, 丢弃比无界增长安全。
+const size_t kMaxUrgentQueue = 64;
 const size_t kMaxCommandBytes = 4096;
 
-const uint32_t kSendDrainBatch = 16;
+// 每轮最多连续排空多少条回包。原先这个常量声明了却没用上, SendLoop 每轮只发一条,
+// 升级传 4000+ 分片时逐条往返锁与条件变量, 吞吐被白白拖低。
+const size_t kSendDrainBatch = 16;
+
+// 收包连续出错的退避间隔。原实现只是累加计数不睡眠, 瞬时错误会在毫秒级
+// 空转满 100 次直接放弃 —— "容忍"名存实亡, 还白烧 CPU。
+const uint32_t kRecvErrBackoffUs = 20 * 1000;
 } // namespace
 
 MopCommandServer::MopCommandServer() {}
@@ -102,6 +112,15 @@ void MopCommandServer::InitAndAccept(void) {
  */
 void MopCommandServer::DeInit(void) {
   running_ = false;
+  // 递增会话号并唤醒发送线程: 让当前会话的收发循环立刻看到失效并收尾,
+  // 不必等 RecvData / 条件等待自然超时。否则 DeInit 返回后上层就析构
+  // flight_/gimbal_/track_, 而收包线程可能仍在跑 —— 悬空指针窗口。
+  {
+    std::lock_guard<std::mutex> lk(sessionMutex_);
+    ++sessionSeq_;
+    clientAlive_.store(false);
+  }
+  sendCond_.notify_all();
   if (listenCn_) {
     DjiMopChannel_Close(listenCn_);
     DjiMopChannel_Destroy(listenCn_);
@@ -115,15 +134,51 @@ void MopCommandServer::DeInit(void) {
 /**
  * accept 循环: 每 500ms 尝试接受一个客户端连接。
  * 接受成功即为该客户端起一个 detached 收包线程(HandleClient)。
- * 支持多客户端各自独立会话。
+ *
+ * **只保留一个会话**: 发送队列是对象级共享的, 多会话并存会让回包串到别的
+ * 通道、心跳重复下发, 两路指令还会抢同一个 TaskWorker 单槽。
+ * App 看门狗判死即重连, 旧连接未必已拆完, 这个场景实际会发生。
+ * 因此新连接到来时先令旧会话退出并等其收尾, 再接管 —— 而不是拒绝新连接
+ * (拒新会让 App 重连永远失败, 因为它认定旧链路已死)。
  */
 void MopCommandServer::AcceptLoop(void) {
   while (running_) {
     T_DjiMopChannelHandle clientCn = nullptr;
     T_DjiReturnCode ret = DjiMopChannel_Accept(listenCn_, &clientCn);
     if (ret == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS && clientCn) {
-      MAICRO_INFO("mop cmd server: client connected");
-      std::thread(&MopCommandServer::HandleClient, this, clientCn).detach();
+      uint64_t session = 0;
+      bool evicted = false;
+      {
+        std::lock_guard<std::mutex> lk(sessionMutex_);
+        evicted = clientAlive_.load();
+        // 递增会话号即令旧会话的收发循环退出(它们每轮比对该号)。
+        session = ++sessionSeq_;
+        clientAlive_.store(true);
+      }
+      // 唤醒旧会话的发送线程, 使其立刻发现会话失效。
+      // **必须在释放 sessionMutex_ 之后做队列操作**: SendLoop 会在持有
+      // sendMutex_ 的条件等待里求值谓词, 若在持 sessionMutex_ 时再去抢
+      // sendMutex_, 两把锁的获取顺序就与 SendLoop 相反, 构成死锁风险。
+      // 故这里统一约定: sessionMutex_ 与 sendMutex_ **绝不嵌套持有**。
+      sendCond_.notify_all();
+      {
+        // 等旧会话把"正在发的那一条"发完并让出。拿到本锁即保证:
+        // 旧会话此后每次发送前都会重新比对会话号, 不会再发出残留包。
+        std::lock_guard<std::mutex> tlk(txMutex_);
+      }
+      {
+        std::lock_guard<std::mutex> qlk(sendMutex_);
+        urgent_.clear();
+        sendQueue_.clear();
+      }
+      if (evicted) {
+        MAICRO_WARN("mop cmd server: new client arrived while old session "
+                    "alive; evicted old session");
+      }
+      MAICRO_INFO("mop cmd server: client connected session=%llu",
+                  (unsigned long long)session);
+      std::thread(&MopCommandServer::HandleClient, this, clientCn, session)
+          .detach();
     } else {
       usleep(500 * 1000);
     }
@@ -137,7 +192,8 @@ void MopCommandServer::AcceptLoop(void) {
  * 每行交 DispatchCommand 处理。同时启动 SendLoop 线程负责回包与心跳。
  * 连续超时/错误达阈值才判链路断开, 单次超时不判死(实测对端仍活)。
  */
-void MopCommandServer::HandleClient(T_DjiMopChannelHandle clientCn) {
+void MopCommandServer::HandleClient(T_DjiMopChannelHandle clientCn,
+                                    uint64_t session) {
   char recvBuf[1024];
   uint32_t realLen = 0;
   std::string lineBuf;
@@ -148,9 +204,11 @@ void MopCommandServer::HandleClient(T_DjiMopChannelHandle clientCn) {
   MAICRO_INFO("mop cmd server: handler start sendLoop+hb every %llums",
               (unsigned long long)kHeartbeatIntervalMs);
 
-  std::thread sendThread(&MopCommandServer::SendLoop, this, clientCn, &alive);
+  std::thread sendThread(&MopCommandServer::SendLoop, this, clientCn, &alive,
+                         session);
 
-  while (running_) {
+  // sessionSeq_ 变化说明已被新连接接管, 本会话必须尽快退出。
+  while (running_ && sessionSeq_.load() == session) {
     T_DjiReturnCode ret = DjiMopChannel_RecvData(clientCn, (uint8_t *)recvBuf,
                                                  sizeof(recvBuf), &realLen);
 
@@ -200,6 +258,8 @@ void MopCommandServer::HandleClient(T_DjiMopChannelHandle clientCn) {
             "mop cmd server: recv err burst ret=0x%08X count=%u (tolerating)",
             ret, errBurst);
       }
+      // 退避: 否则瞬时错误会瞬间累满阈值, 容忍机制形同虚设。
+      usleep(kRecvErrBackoffUs);
       if (errBurst >= kMaxConsecutiveRecvErr) {
         MAICRO_ERROR("mop cmd server: too many consecutive recv errors (%u) "
                      "give up ret=0x%08X",
@@ -210,11 +270,24 @@ void MopCommandServer::HandleClient(T_DjiMopChannelHandle clientCn) {
   }
 
   alive = false;
+  sendCond_.notify_all();
   if (sendThread.joinable())
     sendThread.join();
 
+  // 只有仍是当前会话才落标志/清队列: 被新连接接管时队列已属新会话,
+  // 旧会话在这里清理会把新客户端的回包一并丢掉。
+  // 两把锁分别获取、绝不嵌套(理由见 AcceptLoop)。
+  bool stillCurrent = false;
   {
-    std::lock_guard<std::mutex> lk(sendMutex_);
+    std::lock_guard<std::mutex> lk(sessionMutex_);
+    stillCurrent = (sessionSeq_.load() == session);
+    if (stillCurrent) {
+      clientAlive_.store(false);
+    }
+  }
+  if (stillCurrent) {
+    std::lock_guard<std::mutex> qlk(sendMutex_);
+    urgent_.clear();
     sendQueue_.clear();
   }
 
@@ -226,17 +299,32 @@ void MopCommandServer::HandleClient(T_DjiMopChannelHandle clientCn) {
 /**
  * 发送线程: 排空发送队列并按周期下发心跳("HB\n")。
  *
+ * 发送顺序: **urgent_(飞行指令 ACK) 优先于 sendQueue_(TRK/UPG/EVT)**。
+ * App 侧等 ACK 上限 4 秒, 若 ACK 排在成批升级分片回包之后就可能超时,
+ * 被误判为"未送达"——而飞机其实已经动了。
+ * 每轮最多排空 kSendDrainBatch 条, 减少逐条往返锁与条件变量的开销;
+ * 但每条仍单独 SendData, 不合并成一个大包(App 按行解析, 且合并会放大单次阻塞)。
+ *
  * **独立线程而非在收包线程里发**: 早期版本共用一个线程时,
  * 一次 SendData 阻塞会把收包也卡住, 表现为指令延迟累积。
  * 心跳周期须与 App 侧看门狗阈值匹配, 否则 App 会误判链路中断。
  * 发送耗时超 10ms 或非心跳包都记日志, 便于定位链路抖动。
  */
 void MopCommandServer::SendLoop(T_DjiMopChannelHandle clientCn,
-                                std::atomic<bool> *alive) {
-  int hbCount = 0;
+                                std::atomic<bool> *alive, uint64_t session) {
   auto lastHb = std::chrono::steady_clock::now();
 
+  // 发送与会话校验绑定。txMutex_ 只保证"校验 -> 发出"这一对动作不被接管打断,
+  // 但**它挡不住旧会话回到循环再取下一条**: 批量排空里 sessionValid() 通过后,
+  // 若此刻发生接管, 下一条仍会被取走并发出(实测漏出 1 个包)。
+  // 因此每条待发数据都必须在**取出它的那个临界区内**连带校验会话号 ——
+  // 见下面 takeNext(): 取条目与校验共用 sendMutex_, 接管方推进会话号后
+  // 再抢 txMutex_, 于是旧会话要么已发完在途那一条, 要么取不到新条目。
   auto sendOne = [&](const std::string &data) -> bool {
+    std::lock_guard<std::mutex> tlk(txMutex_);
+    if (sessionSeq_.load() != session || !alive->load() || !running_) {
+      return false;
+    }
     uint32_t sentLen = 0;
     auto s0 = std::chrono::steady_clock::now();
     T_DjiReturnCode sret = DjiMopChannel_SendData(
@@ -264,26 +352,41 @@ void MopCommandServer::SendLoop(T_DjiMopChannelHandle clientCn,
     return true;
   };
 
-  while (alive->load() && running_) {
+  // 会话是否仍有效: 被新连接接管后立即退出, 不再往旧通道发任何数据。
+  auto sessionValid = [&] {
+    return alive->load() && running_ && sessionSeq_.load() == session;
+  };
+
+  while (sessionValid()) {
     std::string item;
     {
       std::unique_lock<std::mutex> lk(sendMutex_);
-      auto now = std::chrono::steady_clock::now();
       auto nextHb = lastHb + std::chrono::milliseconds(kHeartbeatIntervalMs);
       sendCond_.wait_until(lk, nextHb, [&] {
-        return !sendQueue_.empty() || !alive->load() || !running_;
+        return !urgent_.empty() || !sendQueue_.empty() || !sessionValid();
       });
-      if (!alive->load() || !running_)
+      if (!sessionValid())
         return;
-      if (sendQueue_.empty()) {
+      if (urgent_.empty() && sendQueue_.empty()) {
         lastHb = std::chrono::steady_clock::now();
         lk.unlock();
         if (!sendOne(std::string(kHeartbeatText)))
           return;
         continue;
       }
-      item = std::move(sendQueue_.front());
-      sendQueue_.pop_front();
+      // 飞行 ACK 插队; 其余按到达顺序。
+      // **取条目时必须连带复核会话号**: 条件等待醒来与真正取出之间可能已被接管,
+      // 此时条目属于新会话, 旧会话不得取走。
+      if (sessionSeq_.load() != session) {
+        return;
+      }
+      if (!urgent_.empty()) {
+        item = std::move(urgent_.front());
+        urgent_.pop_front();
+      } else {
+        item = std::move(sendQueue_.front());
+        sendQueue_.pop_front();
+      }
     }
     {
       auto t0 = std::chrono::steady_clock::now();
@@ -298,20 +401,66 @@ void MopCommandServer::SendLoop(T_DjiMopChannelHandle clientCn,
     }
     if (!sendOne(item))
       return;
+
+    // 批量排空: 一轮内继续发, 直到两个队列都空或达到批量上限。
+    // 每发一条都重新检查会话有效性, 避免被接管后仍继续发。
+    for (size_t n = 1; n < kSendDrainBatch && sessionValid(); ++n) {
+      std::string next;
+      {
+        std::lock_guard<std::mutex> lk(sendMutex_);
+        // 同上: 取出与复核在同一临界区, 杜绝接管后继续取走新会话的回包。
+        if (sessionSeq_.load() != session) {
+          return;
+        }
+        if (!urgent_.empty()) {
+          next = std::move(urgent_.front());
+          urgent_.pop_front();
+        } else if (!sendQueue_.empty()) {
+          next = std::move(sendQueue_.front());
+          sendQueue_.pop_front();
+        } else {
+          break;
+        }
+      }
+      if (next.compare(0, 6, "UPG,D,") != 0) {
+        MAICRO_INFO("mop [send] data=%s", next.c_str());
+      }
+      if (!sendOne(next))
+        return;
+    }
   }
 }
 
 /**
- * 把一行响应放入发送队列(线程安全)。队列满则丢弃并告警 ——
- * 宁可丢一条回包, 也不让队列无界增长吃掉内存。
+ * 把一行响应放入发送队列(线程安全)。
+ *
+ * **飞行/云台指令的 ACK(OK / ERROR:) 走 urgent_, 其余走 sendQueue_。**
+ * 二者分开的原因: App 等 ACK 上限 4 秒, 而升级期间会有成批分片回包;
+ * 若混在一个队列里排队, ACK 可能等不到就超时, App 误判"未送达",
+ * 可飞机已经执行了动作。urgent_ 永远先发, 且不与批量回包共用容量上限,
+ * 因此批量回包再多也挤不掉飞行 ACK。
+ *
+ * 队列满则丢弃并告警 —— 宁可丢一条回包, 也不让队列无界增长吃掉内存。
+ * urgent_ 上限单独给一个小值: 飞行指令是人手点击级频率, 堆到几十条
+ * 就说明链路已经不正常, 此时丢弃比无界增长安全。
  */
 void MopCommandServer::QueueResponse(const std::string &resp) {
+  const bool isCmdAck = resp.compare(0, 3, "OK\n") == 0 ||
+                        resp.compare(0, 6, "ERROR:") == 0;
   std::lock_guard<std::mutex> lk(sendMutex_);
-  if (sendQueue_.size() >= kMaxSendQueue) {
-    MAICRO_WARN("mop send queue full; response dropped");
-    return;
+  if (isCmdAck) {
+    if (urgent_.size() >= kMaxUrgentQueue) {
+      MAICRO_WARN("mop urgent queue full; cmd ack dropped");
+      return;
+    }
+    urgent_.push_back(resp);
+  } else {
+    if (sendQueue_.size() >= kMaxSendQueue) {
+      MAICRO_WARN("mop send queue full; response dropped");
+      return;
+    }
+    sendQueue_.push_back(resp);
   }
-  sendQueue_.push_back(resp);
   sendCond_.notify_one();
 }
 
