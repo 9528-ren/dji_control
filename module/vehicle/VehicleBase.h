@@ -2,18 +2,11 @@
 #include <string>
 
 #include "MaicroTypedef.h"
+#include "vehicle/VehicleTypes.h"
 
 namespace maicro {
 class ConfM3Gimbal;
 
-struct VoiceFlightTelemetry {
-  E_MaicroFlightStatus status;
-  uint8_t displayMode;
-  S_MaicroPosition position;
-  float32_t altitude;
-  float32_t yawDeg;
-  uint32_t landings;
-};
 
 class VehicleBase {
 public:
@@ -70,17 +63,29 @@ public:
   virtual int64_t SetVelocityControlBody(void) = 0;
   // 切换为摇杆速度控制模式(地面坐标系 NEU: x北 y东, 稳定模式), RTK返航飞回用
   virtual int64_t SetVelocityControlGround(void) = 0;
-  // 下发一次机体坐标系速度矢量 [vx 前后, vy 左右, vz 升降, yawRate]
-  // 单位 m/s, deg/s. x/y 限幅 3, z 限幅 2, yaw 限幅 30
-  // 需以约 10~50Hz 周期连续调用, 停止调用后飞机悬停
-  virtual int64_t FeedVelocityVector(float32_t x, float32_t y, float32_t z,
-                                     float32_t yaw) = 0;
+  /*******************************************************
+   * 通用速度控制
+   *******************************************************/
+  /**
+   * 下发一次速度矢量, 按 limits 指定的包络限幅。
+   * 单位 m/s(x/y/z), deg/s(yaw)。需以约 10~50Hz 周期连续调用,
+   * 停止调用后飞机悬停。
+   *
+   * 包络由调用方(业务层)决定: 按键平移/返航/航迹用 DefaultVelocityLimits(),
+   * 闭环脚本飞行用 ScriptVelocityLimits()。硬件层只负责按包络钳位并下发,
+   * 不认识任何具体业务。两种包络的水平限幅语义不同(逐轴 vs 合速度),
+   * 详见 VelocityLimits 注释, 不可互换。
+   */
+  virtual int64_t FeedVelocity(const VelocityVector &v,
+                               const VelocityLimits &limits) = 0;
 
-  // Dedicated speech trajectory limits. Ordinary widget movement keeps
-  // its existing limits in FeedVelocityVector.
-  virtual int64_t FeedVoiceFlightVelocityVector(float32_t x, float32_t y,
-                                                 float32_t z, float32_t yaw) {
-    return FeedVelocityVector(x, y, z, yaw);
+  /**
+   * 兼容入口: 等价于 FeedVelocity(v, DefaultVelocityLimits())。
+   * 既有按键平移/返航/航迹调用点保持不变。
+   */
+  int64_t FeedVelocityVector(float32_t x, float32_t y, float32_t z,
+                             float32_t yaw) {
+    return FeedVelocity(VelocityVector{x, y, z, yaw}, DefaultVelocityLimits());
   }
 
   /*******************************************************
@@ -100,12 +105,28 @@ public:
   virtual int64_t QueryGimbalAngles(S_MaicroGimbalAngles &angles) = 0;
   // 查询机头航向角, 单位: 度, 北为0顺时针[0,360)
   virtual int64_t QueryDroneYaw(float32_t &yawDeg) = 0;
-  // 脚本使用带新鲜度检查的遥测。其他飞行入口仍使用既有查询。
-  virtual bool ReadVoiceFlightTelemetry(VoiceFlightTelemetry &out) {
+  /*******************************************************
+   * 通用遥测
+   *******************************************************/
+  /**
+   * 一次性取齐一帧遥测快照, 要求每个话题都在新鲜度窗口内(见实现)。
+   * 返回 false 表示数据不完整或过期, 调用方必须放弃本次决策而不是
+   * 用陈旧值继续飞。任何需要闭环控制的业务都应使用本接口, 而不是
+   * 分别调用下面那些单话题查询(它们各自取最新值, 时刻可能不一致)。
+   */
+  virtual bool ReadTelemetry(VehicleTelemetry &out) {
     (void)out;
     return false;
   }
-  virtual uint32_t VoiceControlLossCount() const { return 0; }
+
+  /**
+   * 控制权丢失累计次数: 每当摇杆控制权从本载荷(PSDK)转走时递增。
+   * 业务层在闭环开始前记下该值, 每轮循环比对, 一旦变化立即中止并刹停 ——
+   * 这是防止"控制权已被遥控器抢走却还在下发速度"的核心保护。
+   * 与具体业务无关, 任何闭环飞行都需要。
+   */
+  virtual uint32_t ControlLossCount() const { return 0; }
+
   // 查询 RTK 定位解状态(50=窄区固定解), 见
   // E_DjiFcSubscriptionPositionSolutionProperty
   virtual int64_t QueryRtkSolution(uint8_t &solution) = 0;

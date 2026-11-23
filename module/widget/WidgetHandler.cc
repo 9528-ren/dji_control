@@ -1,3 +1,4 @@
+#include "controller/CommandTable.h"
 #include "WidgetHandler.h"
 
 #include <mutex>
@@ -106,45 +107,15 @@ T_DjiReturnCode WidgetHandler::SetWidgetValue(E_DjiWidgetType type,
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
   }
 
-  switch (index) {
-    case WIDGET_INDEX_TAKEOFF:
-      self->flight_->PostCmd(FlightCmd::TAKEOFF);
-      break;
-    case WIDGET_INDEX_LANDING:
-      self->flight_->PostCmd(FlightCmd::LANDING);
-      break;
-    case WIDGET_INDEX_PITCH_UP:
-      self->gimbal_->PostCmd(GimbalCmd::PITCH_UP);
-      break;
-    case WIDGET_INDEX_PITCH_DOWN:
-      self->gimbal_->PostCmd(GimbalCmd::PITCH_DOWN);
-      break;
-    case WIDGET_INDEX_RECENTER:
-      self->gimbal_->PostCmd(GimbalCmd::RECENTER);
-      break;
-    case WIDGET_INDEX_FLY_TO_TARGET:
-      self->flight_->PostCmd(FlightCmd::FLY_TO_TARGET);
-      break;
-    case WIDGET_INDEX_MOVE_FORWARD:
-      self->flight_->PostCmd(FlightCmd::MOVE_FORWARD);
-      break;
-    case WIDGET_INDEX_MOVE_BACKWARD:
-      self->flight_->PostCmd(FlightCmd::MOVE_BACKWARD);
-      break;
-    case WIDGET_INDEX_MOVE_LEFT:
-      self->flight_->PostCmd(FlightCmd::MOVE_LEFT);
-      break;
-    case WIDGET_INDEX_MOVE_RIGHT:
-      self->flight_->PostCmd(FlightCmd::MOVE_RIGHT);
-      break;
-    case WIDGET_INDEX_GO_HOME:
-      self->flight_->PostCmd(FlightCmd::GO_HOME);
-      break;
-    case WIDGET_INDEX_GO_HOME_RTK:
-      self->flight_->PostCmd(FlightCmd::GO_HOME_RTK);
-      break;
-    default:
-      break;
+  // ??????(? CommandTable.h), ? MOP ??????????
+  // ????? 12 ? case, ? MOP ? else-if ???????????
+  const CommandSpec *spec = FindCommandByWidgetIndex(static_cast<int>(index));
+  if (spec) {
+    if (spec->target == CmdTarget::FLIGHT) {
+      self->flight_->PostCmd(static_cast<FlightCmd>(spec->code));
+    } else {
+      self->gimbal_->PostCmd(static_cast<GimbalCmd>(spec->code));
+    }
   }
   return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }

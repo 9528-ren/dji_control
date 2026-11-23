@@ -22,60 +22,60 @@
 
 namespace maicro {
 namespace {
-using VoiceClock = std::chrono::steady_clock;
+using TelemetryClock = std::chrono::steady_clock;
 
-template <class T> struct VoiceTopic {
+template <class T> struct TelemetrySlot {
   T data{};
   T_DjiDataTimestamp timestamp{};
-  VoiceClock::time_point received{};
+  TelemetryClock::time_point received{};
 
-  bool Fresh(VoiceClock::time_point now) const {
-    return received != VoiceClock::time_point{} &&
+  bool Fresh(TelemetryClock::time_point now) const {
+    return received != TelemetryClock::time_point{} &&
            now - received <= std::chrono::milliseconds(600);
   }
 };
 
-std::mutex voiceTelemetryMutex;
-VoiceTopic<T_DjiFcSubscriptionFlightStatus> voiceFlight;
-VoiceTopic<T_DjiFcSubscriptionDisplaymode> voiceMode;
-VoiceTopic<T_DjiFcSubscriptionPositionFused> voicePosition;
-VoiceTopic<T_DjiFcSubscriptionAltitudeFused> voiceAltitude;
-VoiceTopic<T_DjiFcSubscriptionQuaternion> voiceAttitude;
-uint32_t voiceLandings = 0;
-std::atomic<uint32_t> voiceControlLosses{0};
+std::mutex telemetryMutex;
+TelemetrySlot<T_DjiFcSubscriptionFlightStatus> slotFlightStatus;
+TelemetrySlot<T_DjiFcSubscriptionDisplaymode> slotDisplayMode;
+TelemetrySlot<T_DjiFcSubscriptionPositionFused> slotPosition;
+TelemetrySlot<T_DjiFcSubscriptionAltitudeFused> slotAltitude;
+TelemetrySlot<T_DjiFcSubscriptionQuaternion> slotAttitude;
+uint32_t landingCount = 0;
+std::atomic<uint32_t> controlLossCount{0};
 
 template <class T>
-bool StoreVoiceTopic(VoiceTopic<T> &slot, const uint8_t *data, uint16_t bytes,
+bool StoreTelemetrySlot(TelemetrySlot<T> &slot, const uint8_t *data, uint16_t bytes,
                      const T_DjiDataTimestamp *timestamp) {
   if (!data || !timestamp || bytes < sizeof(T))
     return false;
-  if (slot.received != VoiceClock::time_point{} &&
+  if (slot.received != TelemetryClock::time_point{} &&
       slot.timestamp.millisecond == timestamp->millisecond &&
       slot.timestamp.microsecond == timestamp->microsecond)
     return false;
   memcpy(&slot.data, data, sizeof(T)); // 兼容 SDK 末尾带对齐填充的数据
-  slot.received = VoiceClock::now();
+  slot.received = TelemetryClock::now();
   slot.timestamp = *timestamp;
   return true;
 }
 
-template <class T, VoiceTopic<T> *Slot>
-T_DjiReturnCode OnVoiceTopic(const uint8_t *data, uint16_t bytes,
+template <class T, TelemetrySlot<T> *Slot>
+T_DjiReturnCode OnTelemetryTopic(const uint8_t *data, uint16_t bytes,
                              const T_DjiDataTimestamp *timestamp) {
-  std::lock_guard<std::mutex> lock(voiceTelemetryMutex);
-  StoreVoiceTopic(*Slot, data, bytes, timestamp);
+  std::lock_guard<std::mutex> lock(telemetryMutex);
+  StoreTelemetrySlot(*Slot, data, bytes, timestamp);
   return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
-T_DjiReturnCode OnVoiceFlight(const uint8_t *data, uint16_t bytes,
+T_DjiReturnCode OnFlightStatusTopic(const uint8_t *data, uint16_t bytes,
                               const T_DjiDataTimestamp *timestamp) {
-  std::lock_guard<std::mutex> lock(voiceTelemetryMutex);
-  auto previous = voiceFlight.data;
-  if (StoreVoiceTopic(voiceFlight, data, bytes, timestamp) &&
+  std::lock_guard<std::mutex> lock(telemetryMutex);
+  auto previous = slotFlightStatus.data;
+  if (StoreTelemetrySlot(slotFlightStatus, data, bytes, timestamp) &&
       previous == MAICRO_FLIGHT_STATUS_IN_AIR &&
-      (voiceFlight.data == MAICRO_FLIGHT_STATUS_ON_GROUND ||
-       voiceFlight.data == MAICRO_FLIGHT_STATUS_STOPED)) {
-    ++voiceLandings;
+      (slotFlightStatus.data == MAICRO_FLIGHT_STATUS_ON_GROUND ||
+       slotFlightStatus.data == MAICRO_FLIGHT_STATUS_STOPED)) {
+    ++landingCount;
   }
   return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
@@ -392,44 +392,50 @@ int64_t VehicleDjiPsdk::SetVelocityControlGround(void) {
   return 0;
 }
 
-int64_t VehicleDjiPsdk::FeedVelocityVector(float32_t x, float32_t y,
-                                           float32_t z, float32_t yaw) {
-  T_DjiReturnCode returnCode;
+int64_t VehicleDjiPsdk::FeedVelocity(const VelocityVector &v,
+                                    const VelocityLimits &limits) {
+  float32_t x = v.x, y = v.y, z = v.z, yaw = v.yaw;
 
-  // 限幅, 平移保持小速度: 水平 3 m/s, 垂直 2 m/s, 航向 30 deg/s
-  float32_t speedX = fabs(x) < 3 ? x : (x > 0 ? 3 : -3);
-  float32_t speedY = fabs(y) < 3 ? y : (y > 0 ? 3 : -3);
-  float32_t speedZ = fabs(z) < 2 ? z : (z > 0 ? 2 : -2);
-  float32_t rateYaw = fabs(yaw) < 30 ? yaw : (yaw > 0 ? 30 : -30);
-
-  T_DjiFlightControllerJoystickCommand joystickCommand = {speedX, speedY,
-                                                          speedZ, rateYaw};
-  returnCode = DjiFlightController_ExecuteJoystickAction(joystickCommand);
-  if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-    MAICRO_DEBUG("execute joy stick action failed, error code: 0x%08X",
-                 returnCode);
-    return -1;
+  if (limits.requireFinite) {
+    // 脚本飞行包络: 遥测异常可能算出 NaN/Inf, 整条拒绝下发。
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+        !std::isfinite(yaw))
+      return -1;
   }
 
+  if (limits.vectorHorizontal) {
+    // 合速度限幅: 超限时等比缩放 x/y, 保持航向不变。
+    const double horizontal = std::hypot(x, y);
+    if (horizontal > limits.horizontalMax) {
+      const double scale = limits.horizontalMax / horizontal;
+      x *= scale;
+      y *= scale;
+    }
+    z = std::max(-limits.verticalMax, std::min(limits.verticalMax, z));
+    yaw = std::max(-limits.yawRateMax, std::min(limits.yawRateMax, yaw));
+  } else {
+    // 逐轴独立限幅。**保持既有三元表达式写法**: fabs(x)<h 为假时取
+    // (x>0 ? h : -h), 对 NaN 会落到 -h。这与"先判 isfinite 再钳位"
+    // 不是等价变换, 既有平移/返航/航迹依赖此行为, 不在此擅自更改。
+    const float32_t h = limits.horizontalMax;
+    const float32_t zMax = limits.verticalMax;
+    const float32_t yMax = limits.yawRateMax;
+    x = fabs(x) < h ? x : (x > 0 ? h : -h);
+    y = fabs(y) < h ? y : (y > 0 ? h : -h);
+    z = fabs(z) < zMax ? z : (z > 0 ? zMax : -zMax);
+    yaw = fabs(yaw) < yMax ? yaw : (yaw > 0 ? yMax : -yMax);
+  }
+
+  T_DjiFlightControllerJoystickCommand command = {x, y, z, yaw};
+  const T_DjiReturnCode rc = DjiFlightController_ExecuteJoystickAction(command);
+  if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+    MAICRO_DEBUG("execute joy stick action failed, error code: 0x%08X", rc);
+    return -1;
+  }
   return 0;
 }
 
-int64_t VehicleDjiPsdk::FeedVoiceFlightVelocityVector(
-    float32_t x, float32_t y, float32_t z, float32_t yaw) {
-  if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
-      !std::isfinite(yaw)) return -1;
-  const double horizontal = std::hypot(x, y);
-  if (horizontal > 4.0) {
-    const double scale = 4.0 / horizontal;
-    x *= scale;
-    y *= scale;
-  }
-  z = std::max(-5.0f, std::min(5.0f, z));
-  yaw = std::max(-30.0f, std::min(30.0f, yaw));
-  T_DjiFlightControllerJoystickCommand command = {x, y, z, yaw};
-  const T_DjiReturnCode result = DjiFlightController_ExecuteJoystickAction(command);
-  return result == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS ? 0 : -1;
-}
+
 
 /*******************************************************
  * 状态查询
@@ -517,33 +523,33 @@ int64_t VehicleDjiPsdk::QueryDroneYaw(float32_t &yawDeg) {
   return 0;
 }
 
-bool VehicleDjiPsdk::ReadVoiceFlightTelemetry(VoiceFlightTelemetry &out) {
-  std::lock_guard<std::mutex> lock(voiceTelemetryMutex);
-  const auto now = VoiceClock::now();
-  if (!voiceFlight.Fresh(now) || !voiceMode.Fresh(now) ||
-      !voicePosition.Fresh(now) || !voiceAltitude.Fresh(now) ||
-      !voiceAttitude.Fresh(now))
+bool VehicleDjiPsdk::ReadTelemetry(VehicleTelemetry &out) {
+  std::lock_guard<std::mutex> lock(telemetryMutex);
+  const auto now = TelemetryClock::now();
+  if (!slotFlightStatus.Fresh(now) || !slotDisplayMode.Fresh(now) ||
+      !slotPosition.Fresh(now) || !slotAltitude.Fresh(now) ||
+      !slotAttitude.Fresh(now))
     return false;
 
-  const auto q = voiceAttitude.data;
+  const auto q = slotAttitude.data;
   const double norm = q.q0 * q.q0 + q.q1 * q.q1 + q.q2 * q.q2 + q.q3 * q.q3;
   if (!std::isfinite(norm) || norm < 0.8 || norm > 1.2)
     return false;
   const double x = 1.0 - 2.0 * (q.q2 * q.q2 + q.q3 * q.q3);
   const double y = 2.0 * (q.q1 * q.q2 + q.q0 * q.q3);
   out.yawDeg = static_cast<float32_t>(RAD2DEG(atan2(y, x)));
-  out.status = static_cast<E_MaicroFlightStatus>(voiceFlight.data);
-  out.displayMode = voiceMode.data;
-  const auto pos = voicePosition.data;
+  out.status = static_cast<E_MaicroFlightStatus>(slotFlightStatus.data);
+  out.displayMode = slotDisplayMode.data;
+  const auto pos = slotPosition.data;
   out.position = {RAD2DEG(pos.longitude), RAD2DEG(pos.latitude), pos.altitude,
                   pos.visibleSatelliteNumber};
-  out.altitude = voiceAltitude.data;
-  out.landings = voiceLandings;
+  out.altitude = slotAltitude.data;
+  out.landingCount = landingCount;
   return true;
 }
 
-uint32_t VehicleDjiPsdk::VoiceControlLossCount() const {
-  return voiceControlLosses.load();
+uint32_t VehicleDjiPsdk::ControlLossCount() const {
+  return controlLossCount.load();
 }
 
 int64_t VehicleDjiPsdk::QueryRtkSolution(uint8_t &solution) {
@@ -685,18 +691,18 @@ int64_t VehicleDjiPsdk::InitVehicleSubscription(void) {
     DjiReceiveDataOfTopicCallback callback = nullptr;
   } topics[] = {
       {DJI_FC_SUBSCRIPTION_TOPIC_STATUS_FLIGHT,
-       DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "flight status", true, OnVoiceFlight},
+       DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "flight status", true, OnFlightStatusTopic},
       {DJI_FC_SUBSCRIPTION_TOPIC_STATUS_DISPLAYMODE,
        DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "display mode", true,
-       OnVoiceTopic<T_DjiFcSubscriptionDisplaymode, &voiceMode>},
+       OnTelemetryTopic<T_DjiFcSubscriptionDisplaymode, &slotDisplayMode>},
       {DJI_FC_SUBSCRIPTION_TOPIC_HEIGHT_FUSION,
        DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "height fusion", true},
       {DJI_FC_SUBSCRIPTION_TOPIC_POSITION_FUSED,
        DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "position fused", true,
-       OnVoiceTopic<T_DjiFcSubscriptionPositionFused, &voicePosition>},
+       OnTelemetryTopic<T_DjiFcSubscriptionPositionFused, &slotPosition>},
       {DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_FUSED,
        DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "altitude fused", true,
-       OnVoiceTopic<T_DjiFcSubscriptionAltitudeFused, &voiceAltitude>},
+       OnTelemetryTopic<T_DjiFcSubscriptionAltitudeFused, &slotAltitude>},
       {DJI_FC_SUBSCRIPTION_TOPIC_ALTITUDE_OF_HOMEPOINT,
        DJI_DATA_SUBSCRIPTION_TOPIC_1_HZ, "altitude of home point", true},
       // 云台角度话题只支持 50Hz
@@ -705,7 +711,7 @@ int64_t VehicleDjiPsdk::InitVehicleSubscription(void) {
       // 机头航向(四元数), 方向平移按键计算目标点用; 订阅失败时按键会提示重试
       {DJI_FC_SUBSCRIPTION_TOPIC_QUATERNION, DJI_DATA_SUBSCRIPTION_TOPIC_50_HZ,
        "quaternion", false,
-       OnVoiceTopic<T_DjiFcSubscriptionQuaternion, &voiceAttitude>},
+       OnTelemetryTopic<T_DjiFcSubscriptionQuaternion, &slotAttitude>},
       // RTK 定位解状态, RTK返航按键校验用; 无RTK的机型订阅失败不影响其他功能
       {DJI_FC_SUBSCRIPTION_TOPIC_RTK_POSITION_INFO,
        DJI_DATA_SUBSCRIPTION_TOPIC_10_HZ, "rtk position info", false},
@@ -744,7 +750,7 @@ VehicleDjiPsdk::FlightControlJoystickCtrlAuthSwitchEventCallback(
     T_DjiFlightControllerJoystickCtrlAuthorityEventInfo eventData) {
   if (eventData.curJoystickCtrlAuthority !=
       DJI_FLIGHT_CONTROLLER_JOYSTICK_CTRL_AUTHORITY_OSDK) {
-    voiceControlLosses.fetch_add(1);
+    controlLossCount.fetch_add(1);
   }
   const char *owner = "unknown";
   switch (eventData.curJoystickCtrlAuthority) {

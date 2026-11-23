@@ -47,11 +47,8 @@ public:
   float32_t QueryFlyToRemainDistance(void) { return s_flyToRemainDistance; }
   int64_t SetVelocityControlBody(void);
   int64_t SetVelocityControlGround(void);
-  int64_t FeedVelocityVector(float32_t x, float32_t y, float32_t z,
-                             float32_t yaw);
-
-  int64_t FeedVoiceFlightVelocityVector(float32_t x, float32_t y,
-                                         float32_t z, float32_t yaw) override;
+  int64_t FeedVelocity(const VelocityVector &v,
+                       const VelocityLimits &limits) override;
 
   /*******************************************************
    * 状态查询
@@ -63,8 +60,8 @@ public:
   int64_t QueryDroneHeightFusion(float32_t &height);
   int64_t QueryGimbalAngles(S_MaicroGimbalAngles &angles);
   int64_t QueryDroneYaw(float32_t &yawDeg);
-  bool ReadVoiceFlightTelemetry(VoiceFlightTelemetry &out) override;
-  uint32_t VoiceControlLossCount() const override;
+  bool ReadTelemetry(VehicleTelemetry &out) override;
+  uint32_t ControlLossCount() const override;
   int64_t QueryRtkSolution(uint8_t &solution);
 
   /**

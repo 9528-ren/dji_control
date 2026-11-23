@@ -6,7 +6,9 @@
 #include <mutex>
 #include <string>
 
+#include "FlightContext.h"
 #include "TaskWorker.h"
+#include "VoiceFlightScript.h"
 #include "TrackStore.h"
 #include "vehicle/VehicleBase.h"
 
@@ -26,23 +28,6 @@ enum class FlightCmd {
   VOICE_PREPARE,
   VOICE_ASCEND,
   VOICE_DEPART,
-};
-
-enum class VoiceFlightStage {
-  IDLE,
-  PREPARING,
-  PREPARED,
-  ASCENDING,
-  READY,
-  DEPARTING,
-  COMPLETE,
-  FAILED,
-};
-
-struct VoiceFlightStatus {
-  VoiceFlightStage stage = VoiceFlightStage::IDLE;
-  std::string request;
-  const char *detail = "-";
 };
 
 /** 航迹执行状态机(供 App 轮询 STAT 与 EVT 推送) */
@@ -97,7 +82,7 @@ typedef struct {
 // 飞行控制: 起飞/降落/飞往目标点/返航/航迹执行.
 // 每个动作在工作线程中执行并监控完成状态; 收到新的飞行命令时,
 // 当前动作的监控会被中断, 立即执行新命令(例如飞行途中按"降落"或"返航").
-class FlightController {
+class FlightController : public FlightContext {
  public:
   typedef std::function<void(const std::string &msg)> Notifier;
   /** 航迹事件输出(由 MopCommandServer 接线为向 App 推送 TRK,EVT 行) */
@@ -117,10 +102,26 @@ class FlightController {
 
   static const char *CmdName(FlightCmd cmd);
 
+  // ==================== 语音脚本(业务已移出, 此处仅转发) ====================
+  // 实现见 VoiceFlightScript。本类只负责: 分配 generation 令牌、
+  // 提供共享执行上下文(FlightContext)、把事件接到 MOP 输出。
   const char *RequestVoiceFlight(FlightCmd cmd, const std::string &request,
                                  VoiceFlightStatus &out, bool latest = false);
   VoiceFlightStatus GetVoiceFlightStatus();
   static const char *VoiceStageName(VoiceFlightStage stage);
+
+  // ==================== FlightContext 实现(供业务模块复用) ====================
+  TaskWorker &Worker() override { return worker_; }
+  VehicleBase *Vehicle() override { return vehicle_; }
+  bool Takeoff(bool *controlObtained, bool climbToTargetHeight) override {
+    return DoTakeoff(controlObtained, climbToTargetHeight);
+  }
+  bool IsPositionSane(const S_MaicroPosition &pos) override {
+    return IsHomePositionSane(pos);
+  }
+  E_MaicroFlightStatus Status() override { return GetStatus(); }
+  uint8_t DisplayMode() override { return GetDisplayMode(); }
+  void Notify(const std::string &msg) override;
 
   // ==================== 航迹功能 ====================
 
@@ -136,7 +137,10 @@ class FlightController {
   void SetGimbalMountPos(E_MaicroMountPosition pos) { gimbalMountPos_ = pos; }
 
   /** 注入航迹事件输出通道 */
-  void SetEventSink(EventSink sink) { eventSink_ = sink; }
+  void SetEventSink(EventSink sink) {
+    eventSink_ = sink;
+    voiceScript_.SetEventSink(sink);
+  }
 
   /**
    * 采集当前位姿为一个航点, 写入存储的会话缓冲。
@@ -185,12 +189,6 @@ class FlightController {
  private:
   void Execute(int cmd);
   bool DoTakeoff(bool *controlObtained = nullptr, bool climbToTargetHeight = true);
-  void ExecuteVoiceFlight(FlightCmd cmd);
-  const char *DoVoiceFlight(FlightCmd cmd, uint32_t landings);
-  const char *MoveVoiceFlight(const VoiceFlightTelemetry &origin, double north,
-                              double east, double up, float32_t speed,
-                              uint32_t controlLossCount, bool passThrough = false);
-  void PublishVoiceStatus(const VoiceFlightStatus &status);
   bool DoLanding(void);
   bool DoFlyToTarget(void);
   // 返航: 按起飞时记录的起飞点坐标, 用地面坐标系(NEU)速度闭环飞回, **确认水平到位后**
@@ -237,12 +235,12 @@ class FlightController {
   S_MaicroPosition homePos_;
   bool homePosValid_ = false;
 
+  // 语音脚本业务对象(状态/参数/流程都在它内部)。
+  // generation 仍由本类持有: 按键 PostCmd 与脚本 Request 必须共用同一个
+  // 递增计数, 否则抢占令牌会错位。voiceMutex_ 只保护 generation_ 本身。
+  VoiceFlightScript voiceScript_;
   std::mutex voiceMutex_;
-  VoiceFlightStatus voiceStatus_;
-  FlightCmd voiceCommand_ = FlightCmd::NONE;
-  uint32_t voiceRoundLandings_ = 0;
   uint64_t voiceGeneration_ = 0;
-  std::deque<std::string> voiceRecentRequests_;
 
   // ---- 航迹执行状态 ----
   TrackStore *track_ = nullptr;

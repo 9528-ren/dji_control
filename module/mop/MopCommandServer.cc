@@ -1,5 +1,6 @@
 #include "MopCommandServer.h"
 #include "MaicroLogger.inl"
+#include "controller/CommandTable.h"
 #include "mop/Md5.h"
 #include "mop/SelfUpgrade.h"
 #include <fcntl.h>
@@ -310,33 +311,18 @@ void MopCommandServer::DispatchCommand(const std::string &cmd) {
     QueueResponse("OK\n");
     return;
   }
-  if (cmd == "TAKEOFF") {
-    flight_->PostCmd(FlightCmd::TAKEOFF);
-  } else if (cmd == "LANDING") {
-    flight_->PostCmd(FlightCmd::LANDING);
-  } else if (cmd == "PITCH_UP") {
-    gimbal_->PostCmd(GimbalCmd::PITCH_UP);
-  } else if (cmd == "PITCH_DOWN") {
-    gimbal_->PostCmd(GimbalCmd::PITCH_DOWN);
-  } else if (cmd == "RECENTER") {
-    gimbal_->PostCmd(GimbalCmd::RECENTER);
-  } else if (cmd == "FLY_TO_TARGET") {
-    flight_->PostCmd(FlightCmd::FLY_TO_TARGET);
-  } else if (cmd == "MOVE_FORWARD") {
-    flight_->PostCmd(FlightCmd::MOVE_FORWARD);
-  } else if (cmd == "MOVE_BACKWARD") {
-    flight_->PostCmd(FlightCmd::MOVE_BACKWARD);
-  } else if (cmd == "MOVE_LEFT") {
-    flight_->PostCmd(FlightCmd::MOVE_LEFT);
-  } else if (cmd == "MOVE_RIGHT") {
-    flight_->PostCmd(FlightCmd::MOVE_RIGHT);
-  } else if (cmd == "GO_HOME") {
-    flight_->PostCmd(FlightCmd::GO_HOME);
-  } else if (cmd == "GO_HOME_RTK") {
-    flight_->PostCmd(FlightCmd::GO_HOME_RTK);
-  } else {
+
+  // ??????(? CommandTable.h)?????? 12 ? else-if ?????,
+  // ? WidgetHandler ??? switch ?????, ???????????
+  const CommandSpec *spec = FindCommandByName(cmd);
+  if (!spec) {
     QueueResponse("ERROR:unknown\n");
     return;
+  }
+  if (spec->target == CmdTarget::FLIGHT) {
+    flight_->PostCmd(static_cast<FlightCmd>(spec->code));
+  } else {
+    gimbal_->PostCmd(static_cast<GimbalCmd>(spec->code));
   }
   QueueResponse("OK\n");
 }

@@ -70,6 +70,7 @@ const char *FlightController::CmdName(FlightCmd cmd) {
 }
 
 int64_t FlightController::Init(VehicleBase *vehicle, const S_FlightConf &conf) {
+  voiceScript_.Init(this);
   vehicle_ = vehicle;
   conf_ = conf;
   worker_.Start("flight", [this](int cmd) { Execute(cmd); });
@@ -94,14 +95,7 @@ void FlightController::DeInit(void) { worker_.Stop(); }
 void FlightController::PostCmd(FlightCmd cmd) {
   std::lock_guard<std::mutex> lock(voiceMutex_);
   ++voiceGeneration_;
-  if (voiceStatus_.stage != VoiceFlightStage::IDLE &&
-      voiceStatus_.stage != VoiceFlightStage::COMPLETE &&
-      voiceStatus_.stage != VoiceFlightStage::FAILED) {
-    voiceStatus_.stage = VoiceFlightStage::FAILED;
-    voiceStatus_.detail = "interrupted";
-    voiceCommand_ = FlightCmd::NONE;
-    PublishVoiceStatus(voiceStatus_);
-  }
+  voiceScript_.MarkInterrupted();
   int oldCmd = worker_.Post((int)cmd, voiceGeneration_);
   if (oldCmd) {
     MAICRO_WARN("flight cmd %s not executed yet, replaced by %s",
@@ -118,7 +112,7 @@ void FlightController::Execute(int cmd) {
   const auto flightCmd = static_cast<FlightCmd>(cmd);
   if (flightCmd == FlightCmd::VOICE_PREPARE || flightCmd == FlightCmd::VOICE_ASCEND ||
       flightCmd == FlightCmd::VOICE_DEPART) {
-    ExecuteVoiceFlight(flightCmd);
+    voiceScript_.Execute(static_cast<int>(flightCmd));
     return;
   }
   if (!vehicle_->IsFlightCtrlReady()) {
@@ -258,10 +252,11 @@ bool FlightController::DoTakeoff(bool *controlObtained, bool climbToTargetHeight
         float32_t vz = err * 3.0f;
         if (vz > kTakeoffClimbSpeedMps) vz = kTakeoffClimbSpeedMps;
         else if (vz < -kTakeoffClimbSpeedMps) vz = -kTakeoffClimbSpeedMps;
-        if (vehicle_->FeedVoiceFlightVelocityVector(0, 0, vz, 0) != 0) break;
+        if (vehicle_->FeedVelocity(VelocityVector{0, 0, vz, 0},
+                                   ScriptVelocityLimits()) != 0) break;
         if (!worker_.SleepMs(100)) break;
       }
-      vehicle_->FeedVoiceFlightVelocityVector(0, 0, 0, 0);
+      vehicle_->FeedVelocity(VelocityVector{}, ScriptVelocityLimits());
       vehicle_->QueryDroneRelativeHeight(height);
     } else {
       MAICRO_WARN("takeoff climb skipped: velocity control unavailable");
@@ -828,6 +823,11 @@ uint8_t FlightController::GetDisplayMode(void) {
   return mode;
 }
 
+void FlightController::Notify(const std::string &msg) {
+  MAICRO_INFO("[FLIGHT] %s", msg.c_str());
+  if (notifier_) notifier_(msg.c_str());
+}
+
 void FlightController::Notify(const char *fmt, ...) {
   char buf[256];
   va_list args;
@@ -1329,4 +1329,33 @@ bool FlightController::DoRunTrack(void) {
   trackRunning_.store(false);
   return ok;
 }
+
+// ==================== ??????(????? VoiceFlightScript) ====================
+
+const char *FlightController::RequestVoiceFlight(FlightCmd cmd,
+    const std::string &request, VoiceFlightStatus &out, bool latest) {
+  // generation ???????: ?? PostCmd ????????,
+  // ??????????????????????
+  uint64_t generation;
+  {
+    std::lock_guard<std::mutex> lock(voiceMutex_);
+    generation = voiceGeneration_ + 1;
+  }
+  const char *err = voiceScript_.Request(static_cast<int>(cmd), request, out,
+                                         latest, generation);
+  if (!err) {
+    std::lock_guard<std::mutex> lock(voiceMutex_);
+    voiceGeneration_ = generation;
+  }
+  return err;
+}
+
+VoiceFlightStatus FlightController::GetVoiceFlightStatus() {
+  return voiceScript_.Status();
+}
+
+const char *FlightController::VoiceStageName(VoiceFlightStage stage) {
+  return VoiceFlightScript::StageName(stage);
+}
+
 }  // namespace maicro
