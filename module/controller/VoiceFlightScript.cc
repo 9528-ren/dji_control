@@ -1,6 +1,6 @@
 #include "VoiceFlightScript.h"
 
-#include "FlightController.h"  // ?? FlightCmd ???
+#include "FlightController.h"  // 仅取 FlightCmd 枚举值
 
 #include <algorithm>
 #include <cmath>
@@ -31,9 +31,9 @@ constexpr float kAscentSpeedMps = 5.0f;
 constexpr float kDepartureSpeedMps = 4.0f;
 constexpr double kDepartureFlatLengthM = 10.0;
 
-// ?????: ???? FlightCmd ????, ?????? ??
-// ????????????????(?? VOICE_PREPARE=11 ?? 12),
-// ?"??"??"??"?????????????
+// 脚本命令码: 直接取自 FlightCmd 的枚举值, 不硬编码数字 ——
+// 硬编码会在枚举顺序变动时静默错位(实测 VOICE_PREPARE=11 而非 12),
+// 把"准备"当成"升高"执行会让飞机做出错误动作。
 constexpr int CMD_PREPARE = static_cast<int>(FlightCmd::VOICE_PREPARE);
 constexpr int CMD_ASCEND = static_cast<int>(FlightCmd::VOICE_ASCEND);
 constexpr int CMD_DEPART = static_cast<int>(FlightCmd::VOICE_DEPART);

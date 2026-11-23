@@ -72,9 +72,9 @@ inline const CommandSpec *FindCommandByWidgetIndex(int index) {
   return nullptr;
 }
 
-// ==================== ???????? ====================
-// ??????? WidgetHandler ?????, ???????????
-// (???"??"??"??")?????????????????
+// ==================== 编译期一致性校验 ====================
+// 控件索引必须与 WidgetHandler 的枚举一致, 否则按钮会触发错误动作
+// (例如把"降落"当成"起飞")。这里用静态断言把约定锁在编译期。
 static_assert((int)FlightCmd::TAKEOFF == 1, "FlightCmd order changed");
 static_assert((int)FlightCmd::LANDING == 2, "FlightCmd order changed");
 static_assert((int)GimbalCmd::PITCH_UP == 1, "GimbalCmd order changed");

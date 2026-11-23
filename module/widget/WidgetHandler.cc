@@ -107,8 +107,8 @@ T_DjiReturnCode WidgetHandler::SetWidgetValue(E_DjiWidgetType type,
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
   }
 
-  // ??????(? CommandTable.h), ? MOP ??????????
-  // ????? 12 ? case, ? MOP ? else-if ???????????
+  // 查集中指令表(见 CommandTable.h), 与 MOP 分发共用同一份定义。
+  // 原先这里是 12 个 case, 与 MOP 的 else-if 链各维护一份指令映射。
   const CommandSpec *spec = FindCommandByWidgetIndex(static_cast<int>(index));
   if (spec) {
     if (spec->target == CmdTarget::FLIGHT) {

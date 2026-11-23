@@ -312,8 +312,8 @@ void MopCommandServer::DispatchCommand(const std::string &cmd) {
     return;
   }
 
-  // ??????(? CommandTable.h)?????? 12 ? else-if ?????,
-  // ? WidgetHandler ??? switch ?????, ???????????
+  // 查集中指令表(见 CommandTable.h)。原先这里是 12 个 else-if 字符串比较,
+  // 与 WidgetHandler 的按钮 switch 各维护一份, 加指令要改两处且易漏。
   const CommandSpec *spec = FindCommandByName(cmd);
   if (!spec) {
     QueueResponse("ERROR:unknown\n");

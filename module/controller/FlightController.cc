@@ -1330,12 +1330,12 @@ bool FlightController::DoRunTrack(void) {
   return ok;
 }
 
-// ==================== ??????(????? VoiceFlightScript) ====================
+// ==================== 语音脚本转发(业务实现在 VoiceFlightScript) ====================
 
 const char *FlightController::RequestVoiceFlight(FlightCmd cmd,
     const std::string &request, VoiceFlightStatus &out, bool latest) {
-  // generation ???????: ?? PostCmd ????????,
-  // ??????????????????????
+  // generation 必须由本类分配: 按键 PostCmd 也递增同一个计数,
+  // 两边共用才能正确抢占。业务模块只使用不自增。
   uint64_t generation;
   {
     std::lock_guard<std::mutex> lock(voiceMutex_);
