@@ -12,6 +12,10 @@ WidgetHandler::WidgetHandler() {
 
 WidgetHandler::~WidgetHandler() {}
 
+/**
+ * 向 Pilot 浮窗显示一条消息。加静态互斥: 该 SDK 接口非线程安全,
+ * 而调用来自飞行/云台两个执行线程。失败只记 DEBUG, 不影响飞行。
+ */
 void WidgetHandler::ShowMessage(const std::string &msg) {
   static std::mutex s_mutex;
   std::lock_guard<std::mutex> lck(s_mutex);
@@ -21,6 +25,11 @@ void WidgetHandler::ShowMessage(const std::string &msg) {
   }
 }
 
+/**
+ * 初始化控件: 注册 12 个按钮与浮窗, 接线云台失败提示回调。
+ * 按钮索引与 CommandTable 一致; 配置文件提供图标与布局。
+ * 必须在云台与飞控都就绪之后调用 —— 回调会向它们投递命令。
+ */
 int64_t WidgetHandler::Init(const std::string &cfgDir,
                             GimbalController *gimbal,
                             FlightController *flight) {
@@ -93,6 +102,13 @@ int64_t WidgetHandler::Init(const std::string &cfgDir,
   return 0;
 }
 
+/**
+ * SDK 控件写值回调(运行在 SDK 收发线程)。
+ *
+ * 只记录值并**投递命令**, 绝不在此调用阻塞的 PSDK 接口。
+ * 仅"按钮按下"触发动作, 松开与其他类型只更新值。
+ * 命令映射查 CommandTable, 与 MOP 分发共用同一份定义。
+ */
 T_DjiReturnCode WidgetHandler::SetWidgetValue(E_DjiWidgetType type,
                                               uint32_t index, int32_t value,
                                               void *userData) {
@@ -120,6 +136,7 @@ T_DjiReturnCode WidgetHandler::SetWidgetValue(E_DjiWidgetType type,
   return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
+/// SDK 控件读值回调: 返回最近一次写入的值(原子读), 越界返回 0。
 T_DjiReturnCode WidgetHandler::GetWidgetValue(E_DjiWidgetType type,
                                               uint32_t index, int32_t *value,
                                               void *userData) {

@@ -5,6 +5,19 @@
 #include "MaicroLogger.inl"
 
 namespace maicro {
+/**
+ * 解析配置文件并填充本对象的全部字段。
+ *
+ * 分节读取: [User Info] 应用凭据 / [Dev Info] 设备标识 /
+ * [Gimbal Info] 云台 / [Flight Info] 飞行 / [Widget Info] 控件 /
+ * [Track Info] 航迹。除应用凭据外全部带默认值 —— 段缺失只打 ERROR
+ * 日志并继续启动, 不让服务起不来。
+ *
+ * 经纬度用 double 解析: float 只有约 7 位有效数字, 在度单位下精度
+ * 仅到米级, 会把航点位置抹平。
+ *
+ * 返回 0 成功; -1 文件打不开/格式错; -2 应用凭据不完整(无法注册 PSDK)。
+ */
 int ConfM3Gimbal::ParseConfFile(const std::string &filePath) {
   int ret = 0;
   ret = cfg_.parseFile(filePath.c_str());
@@ -69,6 +82,10 @@ int ConfM3Gimbal::ParseConfFile(const std::string &filePath) {
   return 0;
 }
 
+/**
+ * 读取 double 型配置项。缺失时打 ERROR 并返回 init_val。
+ * 单独实现而不复用 ConfBase 的 float 版本, 是为了保住经纬度精度。
+ */
 double ConfM3Gimbal::GetDoublePara(const std::string &s_type,
                                    const std::string &key_words,
                                    double init_val) {

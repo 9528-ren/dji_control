@@ -36,6 +36,7 @@ FlightController::FlightController() {}
 
 FlightController::~FlightController() { DeInit(); }
 
+/// 飞行命令的可读名, 用于日志与 MOP 协议回显。
 const char *FlightController::CmdName(FlightCmd cmd) {
   switch (cmd) {
     case FlightCmd::TAKEOFF:
@@ -69,6 +70,11 @@ const char *FlightController::CmdName(FlightCmd cmd) {
   }
 }
 
+/**
+ * 初始化飞控: 接线语音脚本的共享上下文、保存配置、启动飞行执行线程。
+ * 所有飞行动作(含语音脚本)都串行在这一个 TaskWorker 上, 这是抢占
+ * 语义成立的前提。配置全部打印到日志, 便于事后核对当时生效的参数。
+ */
 int64_t FlightController::Init(VehicleBase *vehicle, const S_FlightConf &conf) {
   voiceScript_.Init(this);
   vehicle_ = vehicle;
@@ -90,8 +96,17 @@ int64_t FlightController::Init(VehicleBase *vehicle, const S_FlightConf &conf) {
   return 0;
 }
 
+/// 停止飞行执行线程。析构与 Pipeline 释放阶段都会调用。
 void FlightController::DeInit(void) { worker_.Stop(); }
 
+/**
+ * 投递飞行命令(线程安全, 非阻塞), 并**抢占**正在执行的语音脚本。
+ *
+ * 递增 generation 令牌 -> 通知脚本标记为中断 -> 投递命令(单槽覆盖)。
+ * 令牌是抢占的核心: 执行中的脚本每轮比对 ExecutingToken(), 不等即收尾,
+ * 避免"按键已下发新动作, 旧脚本还在发速度矢量"。
+ * 被覆盖的旧命令会打 WARN, 便于排查连点导致的动作丢失。
+ */
 void FlightController::PostCmd(FlightCmd cmd) {
   std::lock_guard<std::mutex> lock(voiceMutex_);
   ++voiceGeneration_;
@@ -103,6 +118,14 @@ void FlightController::PostCmd(FlightCmd cmd) {
   }
 }
 
+/**
+ * 飞行命令执行入口(运行在飞行执行线程)。
+ *
+ * 先校验令牌: 若本命令已被更新的命令取代则直接丢弃, 不执行任何动作。
+ * 语音脚本命令转交 VoiceFlightScript; 其余按键命令在此分派到各 Do* 实现。
+ * 执行前后各打一条日志, 形成 "start / end, result" 配对, 便于判断动作
+ * 是正常结束还是被中断。
+ */
 void FlightController::Execute(int cmd) {
   {
     std::lock_guard<std::mutex> lock(voiceMutex_);
@@ -153,6 +176,17 @@ void FlightController::Execute(int cmd) {
               ok ? "ok" : "failed/interrupted");
 }
 
+/**
+ * 自动起飞, 并可选续爬升到配置高度。
+ *
+ * 起飞前记录起飞点坐标作为返航目标 —— 这是返航能否落回原地的唯一依据,
+ * 故必须过 IsHomePositionSane 校验(无定位时飞控会给出近零垃圾坐标)。
+ * 非 RTK 固定解时仍允许起飞, 但会提示返航将按 GPS 精度执行。
+ *
+ * SDK 自动起飞只到约 1.2m; climbToTargetHeight=true 时用速度闭环续爬到
+ * kTakeoffHeightM。续爬失败不改变"起飞成功"的结论 —— 飞机已在空中悬停。
+ * controlObtained 回填是否已取控制权, 供调用方决定是否需释放。
+ */
 bool FlightController::DoTakeoff(bool *controlObtained, bool climbToTargetHeight) {
   if (GetStatus() == MAICRO_FLIGHT_STATUS_IN_AIR) {
     Notify("飞机已在空中, 忽略起飞");
@@ -266,6 +300,11 @@ bool FlightController::DoTakeoff(bool *controlObtained, bool climbToTargetHeight
   return true;
 }
 
+/**
+ * 原地降落。要求飞机在空中, 否则忽略(地面下发降落无意义)。
+ * 取得控制权 -> 请求降落 -> 等进入自动降落模式 -> 监控到落地 -> 释放控制权。
+ * 降落保护触发时按配置决定自动确认还是提示飞手在遥控器上确认。
+ */
 bool FlightController::DoLanding(void) {
   if (GetStatus() != MAICRO_FLIGHT_STATUS_IN_AIR) {
     Notify("飞机不在空中, 忽略降落");
@@ -290,6 +329,12 @@ bool FlightController::DoLanding(void) {
   return true;
 }
 
+/**
+ * 飞往配置中的固定目标点(由飞控自主规划航线)。
+ *
+ * 要求先手动起飞: 地面直接下发会让飞机自动起飞, 行为不可控。
+ * 目标点未配置(经纬度双零)或超出 maxDistance 时拒绝, 避免飞向错误坐标。
+ */
 bool FlightController::DoFlyToTarget(void) {
   if (GetStatus() != MAICRO_FLIGHT_STATUS_IN_AIR) {
     // 地面下发会让飞机自动起飞, 这里要求先手动起飞, 行为更可控
@@ -366,6 +411,16 @@ bool FlightController::DoFlyToTarget(void) {
   return true;
 }
 
+/**
+ * 返航: 飞回起飞时记录的坐标并降落。**不区分 RTK/GPS**。
+ *
+ * 用地面坐标系(NEU)速度闭环飞回, 到位容差随定位质量自适应:
+ * RTK 固定解 1m, 否则 3m。途中保持高度, 不在半路下降。
+ *
+ * 安全约束: 每条退出路径都先零速度再释放控制权; **未复核到位绝不降落**,
+ * 宁可悬停并上报剩余距离, 也不在错误位置落地。
+ * 起飞点不可用或距离超限时转 DoGoHomeNative 交由飞控自主返航。
+ */
 bool FlightController::DoGoHome(void) {
   if (GetStatus() != MAICRO_FLIGHT_STATUS_IN_AIR) {
     Notify("飞机不在空中, 忽略返航");
@@ -569,6 +624,12 @@ bool FlightController::DoGoHome(void) {
   return true;
 }
 
+/**
+ * 原生返航回退路径: 起飞点未记录时(如程序启动时飞机已在空中)使用。
+ * 交由飞控自主返航降落, 本函数只监控到落地为止。
+ * **仅以 IN_AIR -> 落地 判定结束, 不从 displayMode 推断"已到达"** ——
+ * 那正是早期版本的缺陷: 模式一变就宣告到位并降落, 结果落在半路。
+ */
 bool FlightController::DoGoHomeNative(void) {
   if (GetStatus() != MAICRO_FLIGHT_STATUS_IN_AIR) {
     Notify("飞机不在空中, 忽略返航");
@@ -606,6 +667,13 @@ bool FlightController::DoGoHomeNative(void) {
   return true;
 }
 
+/**
+ * 沿机头前/后/左/右平移 moveDistance 米, 保持当前高度。
+ *
+ * 用机体坐标系(FRU: x 前正 / y 右正 / z 上正)速度闭环。
+ * **符号必须与 SetVelocityControlBody() 配套**: 左移 y=-1, 右移 y=+1。
+ * 若改用地面坐标系(NEU, y 正为东), 符号含义完全不同, 不可沿用。
+ */
 bool FlightController::DoMove(FlightCmd cmd) {
   if (GetStatus() != MAICRO_FLIGHT_STATUS_IN_AIR) {
     Notify("请先起飞, 再使用方向按键");
@@ -710,6 +778,10 @@ bool FlightController::DoMove(FlightCmd cmd) {
   return false;
 }
 
+/**
+ * 查询 RTK 是否为固定解。solution 回填原始解状态供回显。
+ * 50 = NARROW_INT(窄区固定解, 厘米级)才算 RTK 正常; 其余一律视为非固定解。
+ */
 bool FlightController::QueryRtkFixed(uint8_t &solution) {
   if (vehicle_->QueryRtkSolution(solution)) {
     return false;
@@ -718,6 +790,14 @@ bool FlightController::QueryRtkFixed(uint8_t &solution) {
   return solution == 50;
 }
 
+/**
+ * 校验一个位置能否作为返航起飞点。三道门槛:
+ *   1) 经纬度绝对值 >= 1e-4 度(约 11m): 无定位时融合位置会收敛到 (0,0)
+ *      附近的极小值, 旧判据 "!= 0" 会放行 0.00000015 这类垃圾值
+ *   2) 纬度 [-90,90] / 经度 [-180,180]
+ *   3) 可见卫星数达配置阈值
+ * 记错起飞点意味着让飞机飞向数千公里外或不该降落的地方, 故校验从严。
+ */
 bool FlightController::IsHomePositionSane(const S_MaicroPosition &pos) {
   // 返航起飞点是"飞回去降落"的目标, 一旦记错就是让飞机飞向数千公里外的
   // 错误坐标或在不该降落的地方降落, 因此校验必须严格。
@@ -742,6 +822,10 @@ bool FlightController::IsHomePositionSane(const S_MaicroPosition &pos) {
   return true;
 }
 
+/**
+ * RTK 返航按键入口。**行为与 DoGoHome 完全一致**(不区分定位源),
+ * 保留独立命令仅为兼容既有按钮与 App 协议。
+ */
 bool FlightController::DoGoHomeRtk(void) {
   // 按使用者要求: 返航**不区分 RTK 与 GPS**, 两个按钮行为完全一致 ——
   // 都是飞回起飞时记录的起飞点, 确认水平到位后再降落。
@@ -755,6 +839,11 @@ bool FlightController::DoGoHomeRtk(void) {
   return DoGoHome();
 }
 
+/**
+ * 等待进入指定飞行模式, 每 100ms 轮询一次。
+ * mode 与 altMode 任一命中即成功(如自动降落有普通与强制两种模式码)。
+ * 超时或被新命令打断均返回 false。
+ */
 bool FlightController::WaitDisplayMode(uint8_t mode, uint8_t altMode,
                                        uint32_t timeoutMs) {
   uint32_t waited = 0;
@@ -766,6 +855,13 @@ bool FlightController::WaitDisplayMode(uint8_t mode, uint8_t altMode,
   }
 }
 
+/**
+ * 监控降落直到落地。每秒查一次融合离地高度:
+ * 低于 LANDING_CONFIRM_HEIGHT 时按配置自动确认降落(每 5s 重试一次),
+ * 或提示飞手在遥控器上确认(只提示一次, 避免刷屏)。
+ * 超时或被新命令打断返回 false —— 此时飞机可能仍在下降, 调用方不应
+ * 宣告"降落完成"。
+ */
 bool FlightController::WaitLanded(uint32_t timeoutS) {
   uint32_t lastConfirmS = 0;
   uint32_t waitedS = 0;
@@ -799,6 +895,10 @@ bool FlightController::WaitLanded(uint32_t timeoutS) {
   return true;
 }
 
+/**
+ * 两点间水平大圆距离(米), Haversine 公式, 地球半径取 6378137m。
+ * 入参为度。用于返航到位判定与航迹最近点搜索。
+ */
 double FlightController::HorizontalDistance(double lat1, double lon1,
                                             double lat2, double lon2) {
   const double R = 6378137.0;
@@ -811,23 +911,33 @@ double FlightController::HorizontalDistance(double lat1, double lon1,
   return 2 * R * atan2(sqrt(a), sqrt(1 - a));
 }
 
+/// 查询当前飞行状态(地面未启动/地面已启动/空中)。查询失败时按地面处理。
 E_MaicroFlightStatus FlightController::GetStatus(void) {
   E_MaicroFlightStatus status = MAICRO_FLIGHT_STATUS_STOPED;
   vehicle_->QueryDroneStatus(status);
   return status;
 }
 
+/// 查询当前飞行模式码(见 E_MaicroDisplayMode)。
 uint8_t FlightController::GetDisplayMode(void) {
   uint8_t mode = 0;
   vehicle_->QueryDroneDisplayMode(mode);
   return mode;
 }
 
+/**
+ * 向 Pilot 浮窗推送提示并记入日志(printf 风格)。
+ * 所有面向飞手的状态提示都经此出口, 便于统一加 [FLIGHT] 前缀。
+ */
 void FlightController::Notify(const std::string &msg) {
   MAICRO_INFO("[FLIGHT] %s", msg.c_str());
   if (notifier_) notifier_(msg.c_str());
 }
 
+/**
+ * Notify 的 std::string 重载, 供业务模块经 FlightContext 调用 ——
+ * 业务层不必为拼一个字符串而引入 varargs。
+ */
 void FlightController::Notify(const char *fmt, ...) {
   char buf[256];
   va_list args;
@@ -855,6 +965,11 @@ void FlightController::QueryRtkStatus(uint8_t &solution, bool &fixed,
   if (vehicle_->QueryNetworkRtkState(ns) == 0) networkState = ns;
 }
 
+/**
+ * 连续 times 次、间隔 intervalMs 检查 RTK 均为固定解且卫星数达标。
+ * 任一次不达标立即返回 false, lastSol 回填最后一次解状态供提示。
+ * 用于航迹执行前的稳定性门控: 单次固定解可能是瞬时抖动。
+ */
 bool FlightController::WaitRtkStable(int times, uint32_t intervalMs,
                                      uint8_t &lastSol) {
   for (int i = 0; i < times; ++i) {
@@ -871,6 +986,11 @@ bool FlightController::WaitRtkStable(int times, uint32_t intervalMs,
   return true;
 }
 
+/**
+ * 采集当前位姿为一个航点(在 MOP 线程调用, 只做查询与内存写入, 不飞)。
+ * 门槛: 存储就绪 -> 位置有效(非近零) -> RTK 固定解 -> 相对高度可读 ->
+ * 云台角度可读。errToken 回填协议错误码供 App 显示具体原因。
+ */
 int FlightController::RecordTrackPoint(S_TrackPoint &out,
                                        const char **errToken) {
   if (!track_) {
@@ -931,6 +1051,16 @@ int FlightController::RecordTrackPoint(S_TrackPoint &out,
   return 0;
 }
 
+/**
+ * 航迹执行的同步预检(在 MOP 线程调用, 不做任何飞行操作)。
+ *
+ * 逐项校验: 存储就绪 / 未在执行中 / 飞机在空中 / 航迹可加载且非空 /
+ * RTK 稳定 / 航迹不含非固定解点 / 最近点距离不超限 / 起始序号合法。
+ * 通过则回填执行计划(名称/起点/总点数/最近距离)。
+ *
+ * 通过后由 RequestTrackRun 投递执行; **执行线程入口会再复检一次**,
+ * 防预检与执行之间的状态变化(TOCTOU)。
+ */
 int FlightController::PreCheckTrackRun(const std::string &name, int reqStartIdx,
                                        S_TrackRunPlan &plan,
                                        const char **errToken) {
@@ -1021,6 +1151,10 @@ int FlightController::PreCheckTrackRun(const std::string &name, int reqStartIdx,
   return 0;
 }
 
+/**
+ * 记录执行计划并投递 TRACK_RUN。清除上一次的中止标志。
+ * 名称与起点先存到成员, 因为 PostCmd 只传命令号不带参数。
+ */
 void FlightController::RequestTrackRun(const std::string &name, int startIdx) {
   {
     std::lock_guard<std::mutex> lk(trackMutex_);
@@ -1031,6 +1165,7 @@ void FlightController::RequestTrackRun(const std::string &name, int startIdx) {
   PostCmd(FlightCmd::TRACK_RUN);
 }
 
+/// 读取航迹执行状态(线程安全), 供 App 轮询 STAT。同时回填当前 RTK 解状态。
 void FlightController::GetTrackStatus(S_TrackRunStatus &out) {
   std::lock_guard<std::mutex> lk(trackMutex_);
   out.state = (TrackState)trackState_.load();
@@ -1042,12 +1177,22 @@ void FlightController::GetTrackStatus(S_TrackRunStatus &out) {
   out.rtkSol = sol;
 }
 
+/**
+ * 请求中止航迹执行。
+ * **不走 PostCmd**: TaskWorker 是单槽, Post 会覆盖未取走的命令,
+ * 中止指令可能因此丢失。这里直接置原子标志, 执行循环每步都检查,
+ * 保证中止永不丢失。
+ */
 void FlightController::AbortTrack(const char *reason) {
   abortTrack_.store(true);
   MAICRO_WARN("track abort requested: %s", reason ? reason : "user");
   Notify("航迹中止请求: %s", reason ? reason : "用户");
 }
 
+/**
+ * 推送一行航迹事件给 App(TRK,EVT,<state>,<cur>,<total>,<name>)。
+ * 名称经 EncodeName 转义, 避免逗号或换行破坏单行协议。
+ */
 void FlightController::PublishTrackEvent(const char *stateName) {
   if (!eventSink_) return;
   S_TrackRunStatus s;
@@ -1058,6 +1203,14 @@ void FlightController::PublishTrackEvent(const char *stateName) {
   eventSink_(std::string(line) + "\n");
 }
 
+/**
+ * 执行航迹: 从最近点(或指定点)起逐点串行飞完剩余航点。
+ *
+ * 入口复检状态与 RTK(防 TOCTOU), 重新求最近点(位置可能已变)。
+ * 逐点飞行中每轮检查中止标志、控制权、遥测有效性与是否已落地;
+ * 任一项异常即中止并刹停, **不自动返航** —— 交由飞手决定后续动作。
+ * 每点到位后转云台到该点记录的俯仰角(相对角), 再飞下一点。
+ */
 bool FlightController::DoRunTrack(void) {
   if (!track_) {
     Notify("航迹执行失败: 存储未就绪");
@@ -1350,10 +1503,12 @@ const char *FlightController::RequestVoiceFlight(FlightCmd cmd,
   return err;
 }
 
+/// 读取语音脚本状态(转发到 VoiceFlightScript, 业务实现不在本类)。
 VoiceFlightStatus FlightController::GetVoiceFlightStatus() {
   return voiceScript_.Status();
 }
 
+/// 语音阶段的可读名(转发到 VoiceFlightScript::StageName)。
 const char *FlightController::VoiceStageName(VoiceFlightStage stage) {
   return VoiceFlightScript::StageName(stage);
 }

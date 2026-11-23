@@ -120,6 +120,11 @@ TrackStore::TrackStore() : dirReady_(false) {}
 
 TrackStore::~TrackStore() {}
 
+/**
+ * 初始化存储目录并校验可用性: 建目录(已存在不算错) -> 确认是目录 ->
+ * 确认可写可进入。任一不满足则 dirReady_ 保持 false, 后续所有文件
+ * 操作都会拒绝执行而不是静默丢数据。
+ */
 int TrackStore::Init(const std::string &dir) {
   dir_ = dir;
   dirReady_ = false;
@@ -163,6 +168,15 @@ int TrackStore::BeginSession() {
   return 0;
 }
 
+/**
+ * 采集一个航点进会话缓冲(内存, 不落盘)。四道准入门槛, 任一不过即拒绝:
+ *   -1 会话已满(kMaxPoints)
+ *   -2 位置无效: 越界或经纬度双近零(未定位时飞控会给 0.0000005 这类值,
+ *      存下来回放会让飞机飞向赤道原点)
+ *   -3 RTK 非固定解: 精度只到米级甚至更差, 回放没有价值
+ *   -4 相对高度越界
+ * 通过则按当前会话长度分配 1-based 序号并返回该序号。
+ */
 int TrackStore::AddPoint(const S_TrackPoint &pt) {
   std::lock_guard<std::mutex> lk(sessionMutex_);
 
@@ -200,6 +214,7 @@ int TrackStore::AddPoint(const S_TrackPoint &pt) {
   return (int)p.idx;
 }
 
+/// 当前会话已采集的点数(线程安全)。
 int TrackStore::SessionPointCount() {
   std::lock_guard<std::mutex> lk(sessionMutex_);
   return (int)session_.size();
@@ -211,6 +226,11 @@ std::string TrackStore::FilePath(const std::string &name) const {
   return dir_ + "/" + name + kFileExt;
 }
 
+/**
+ * 航迹名合法性校验。拒绝空名、超长名、控制字符, 以及会破坏协议或
+ * 造成路径穿越的字符: CR/LF(单行协议) 逗号与竖线(字段分隔)
+ * %(转义引导) 空格(文件头分隔) / \ .(路径穿越与扩展名伪造)。
+ */
 bool TrackStore::IsValidName(const std::string &name) {
   if (name.empty() || name.size() > kNameMaxBytes) return false;
   for (size_t i = 0; i < name.size(); ++i) {
@@ -235,6 +255,11 @@ bool TrackStore::IsValidName(const std::string &name) {
   return true;
 }
 
+/**
+ * 把航迹名转义成可安全写入单行协议与文件头的形式(%XX)。
+ * 与 DecodeName 互逆。中文等非 ASCII 字节原样保留 —— 只转义
+ * 会破坏结构的字符, 不做全量 URL 编码, 以保持文件名可读。
+ */
 std::string TrackStore::EncodeName(const std::string &raw) {
   std::string out;
   out.reserve(raw.size() + 8);
@@ -255,6 +280,10 @@ std::string TrackStore::EncodeName(const std::string &raw) {
   return out;
 }
 
+/**
+ * 还原 EncodeName 的转义。遇到非法 %XX 序列时原样输出该字符,
+ * 不报错 —— 解析器对损坏文件另有校验和与字段检查把关。
+ */
 std::string TrackStore::DecodeName(const std::string &enc) {
   std::string out;
   out.reserve(enc.size());
@@ -274,6 +303,11 @@ std::string TrackStore::DecodeName(const std::string &enc) {
   return out;
 }
 
+/**
+ * 单个航点的合理性校验(用于解析已存文件)。比 AddPoint 宽松:
+ * 不查 RTK 解状态(历史文件可能由旧版写入), 但位置与高度必须可信,
+ * 云台俯仰需在 [-180,180] 内。任一不过则整个文件判为损坏。
+ */
 bool TrackStore::IsPointSane(const S_TrackPoint &p) {
   if (!(fabs(p.lat) <= 90.0 && fabs(p.lon) <= 180.0)) return false;
   if (fabs(p.lat) < 1e-6 && fabs(p.lon) < 1e-6) return false;  // 未定位
@@ -282,6 +316,7 @@ bool TrackStore::IsPointSane(const S_TrackPoint &p) {
   return true;
 }
 
+/// FNV-1a 32 位哈希, 用作航点块校验和。非密码学用途, 只防意外损坏。
 uint32_t TrackStore::Fnv1a(const std::string &s) {
   uint32_t h = 2166136261u;
   for (size_t i = 0; i < s.size(); ++i) {
@@ -291,6 +326,11 @@ uint32_t TrackStore::Fnv1a(const std::string &s) {
   return h;
 }
 
+/**
+ * 把航迹序列化为文本文件内容。
+ * **校验和只覆盖 WP 航点块**, 不含文件头 —— 这样重命名航迹不必
+ * 重算点数据校验和。航迹名以 EncodeName 转义后写入头部。
+ */
 std::string TrackStore::Serialize(const S_Track &t) {
   // 先拼 WP 块, 校验和只覆盖它 —— 重命名航迹不需要改点数据校验和
   std::string wpBlock;
@@ -323,6 +363,11 @@ std::string TrackStore::Serialize(const S_Track &t) {
   return std::string(header) + wpBlock;
 }
 
+/**
+ * 解析航迹文件内容。校验文件头、字段数、逐点合理性与 WP 块校验和。
+ * 任一处不符即返回非 0 并给出原因, **绝不返回部分数据** ——
+ * 坐标可疑的航迹不能拿去飞。
+ */
 int TrackStore::Parse(const std::string &content, S_Track &out,
                       std::string &reason) {
   // 按 '\n' 切行
@@ -464,6 +509,13 @@ int TrackStore::Parse(const std::string &content, S_Track &out,
   return 0;
 }
 
+/**
+ * 把当前会话保存为具名航迹文件。
+ * 落盘用"写临时文件 -> fsync -> rename"三步: rename 在同一文件系统内
+ * 原子, 掉电只会留下完整旧文件或完整新文件, 不会出现半截文件。
+ * 返回 0 成功; -1 名字非法; -2 会话为空; -3 已存在且未指定 force;
+ * -4 存储不可用或 IO 失败; -5 序列化失败。
+ */
 int TrackStore::SaveTrack(const std::string &name, bool force) {
   if (!IsValidName(name)) {
     MAICRO_ERROR("save track: invalid name '%s'", name.c_str());
@@ -549,6 +601,11 @@ int TrackStore::SaveTrack(const std::string &name, bool force) {
   return 0;
 }
 
+/**
+ * 读取并解析具名航迹。
+ * 返回 0 成功; -1 名字非法; -2 文件不存在; -3 文件损坏。
+ * **损坏时不回填 out**: 宁可查不到, 也不能让可疑坐标进入执行路径。
+ */
 int TrackStore::LoadTrack(const std::string &name, S_Track &out) {
   if (!IsValidName(name)) {
     MAICRO_ERROR("load track: invalid name '%s'", name.c_str());
@@ -583,6 +640,10 @@ int TrackStore::LoadTrack(const std::string &name, S_Track &out) {
   return 0;
 }
 
+/**
+ * 列出目录下所有航迹(名称/点数/创建时间)。
+ * 逐个读取并解析以取得点数, 损坏文件跳过并记日志, 不影响其余条目。
+ */
 int TrackStore::ListTracks(std::vector<S_TrackItem> &out) {
   out.clear();
   std::lock_guard<std::mutex> lk(fileMutex_);
@@ -643,6 +704,9 @@ int TrackStore::ListTracks(std::vector<S_TrackItem> &out) {
   return 0;
 }
 
+/**
+ * 删除具名航迹文件。名字先过合法性校验, 避免路径穿越删到目录外的文件。
+ */
 int TrackStore::DeleteTrack(const std::string &name) {
   if (!IsValidName(name)) {
     MAICRO_ERROR("delete track: invalid name '%s'", name.c_str());
@@ -668,6 +732,7 @@ int TrackStore::DeleteTrack(const std::string &name) {
   return 0;
 }
 
+/// 具名航迹是否存在(名字先过合法性校验)。
 bool TrackStore::Exists(const std::string &name) {
   if (!IsValidName(name)) return false;
   std::lock_guard<std::mutex> lk(fileMutex_);
@@ -675,6 +740,10 @@ bool TrackStore::Exists(const std::string &name) {
   return ::stat(FilePath(name).c_str(), &st) == 0;
 }
 
+/**
+ * 航迹中是否含 RTK 非固定解的点。执行前用它做门控:
+ * 含非固定解点的航迹回放精度不可控, 应拒绝执行或提示风险。
+ */
 bool TrackStore::HasNonFixedRtkPoint(const S_Track &t) {
   for (size_t i = 0; i < t.pts.size(); ++i) {
     if (t.pts[i].rtkSol != kRtkFixed) return true;

@@ -76,6 +76,7 @@ void HorizontalOffset(const S_MaicroPosition &origin,
 VoiceFlightScript::VoiceFlightScript() {}
 VoiceFlightScript::~VoiceFlightScript() {}
 
+/// 阶段的可读名, 用于事件推送与日志。
 const char *VoiceFlightScript::StageName(Stage stage) {
   switch (stage) {
     case Stage::IDLE: return "IDLE";
@@ -90,6 +91,10 @@ const char *VoiceFlightScript::StageName(Stage stage) {
   return "FAILED";
 }
 
+/**
+ * 推送一行脚本状态事件(TRK,VOICE_EVT,VOICE2,<stage>,<request>,<detail>)。
+ * 只做入队, 不在此调用 SDK 或网络接口 —— 本函数可能在飞行执行线程被调。
+ */
 void VoiceFlightScript::Publish(const VoiceFlightStatus &status) {
   if (!eventSink_ || status.request.empty()) return;
   // Queue-only event sink: no SDK/network call from the flight worker.
@@ -97,6 +102,10 @@ void VoiceFlightScript::Publish(const VoiceFlightStatus &status) {
              "," + status.request + "," + status.detail + "\n");
 }
 
+/**
+ * 被新指令抢占时由 FlightController 调用: 把进行中的阶段标记为 FAILED
+ * 并推送事件。已完成/已失败/空闲状态不动, 避免覆盖终态。
+ */
 void VoiceFlightScript::MarkInterrupted() {
   std::lock_guard<std::mutex> lock(mutex_);
   if (status_.stage != Stage::IDLE && status_.stage != Stage::COMPLETE &&
@@ -108,6 +117,11 @@ void VoiceFlightScript::MarkInterrupted() {
   }
 }
 
+/**
+ * 读取脚本状态(MOP 线程)。
+ * 处于 PREPARED/READY 等待态时顺带查一次遥测: 若已落地或落地计数变化,
+ * 就地把状态降级为 FAILED(landed) —— 飞机都落地了, 等待态没有意义。
+ */
 VoiceFlightStatus VoiceFlightScript::Status() {
   std::lock_guard<std::mutex> lock(mutex_);
   if (status_.stage == Stage::PREPARED || status_.stage == Stage::READY) {
@@ -122,6 +136,15 @@ VoiceFlightStatus VoiceFlightScript::Status() {
   return status_;
 }
 
+/**
+ * 受理一条脚本请求(MOP 线程, 只校验与投递, 不阻塞)。
+ *
+ * 幂等: 同 request 同命令直接回当前状态; 同 request 不同命令回 badrequest。
+ * latest 模式可抢占并去重最近 64 条 request; 非 latest 模式忙则拒绝。
+ * 逐阶段前置条件: 准备须在地面, 升高须已准备, 出发须已升高;
+ * 非准备阶段还须在空中、处于位置模式、落地计数未变。
+ * generation 由 FlightController 分配, 本模块只使用不自增。
+ */
 const char *VoiceFlightScript::Request(int cmd, const std::string &request,
                                        VoiceFlightStatus &out, bool latest,
                                        uint64_t generation) {
@@ -185,6 +208,14 @@ const char *VoiceFlightScript::Request(int cmd, const std::string &request,
   return nullptr;
 }
 
+/**
+ * 执行脚本(共享飞行执行线程)。
+ *
+ * 先校验令牌与阶段, 取出 request 与落地计数后释放锁再执行 ——
+ * 执行期间不持锁, 否则 MOP 线程查状态会被阻塞。
+ * 执行完按命令类型置终态(准备->PREPARED, 升高->READY, 出发->COMPLETE),
+ * 若期间 request 已变或阶段已非进行中则不覆盖(说明已被抢占)。
+ */
 void VoiceFlightScript::Execute(int cmd) {
   std::string request;
   uint32_t landings;
@@ -219,6 +250,16 @@ void VoiceFlightScript::Execute(int cmd) {
   }
 }
 
+/**
+ * 脚本主体: 取控制权 -> 按命令执行动作 -> 释放控制权。
+ *
+ * 准备阶段复用飞控的自动起飞原语(不续爬), 随后等模式切到位置模式;
+ * 升高/出发阶段自行取控制权。出发分两段: 斜爬(到 5m 高)后接平飞,
+ * 两段共用同一航向与高度基准, 交接处不刹停(passThrough)。
+ *
+ * **释放控制权前先比对失控计数**: 若期间控制权已被抢走, 不去释放
+ * 别人持有的控制权。
+ */
 const char *VoiceFlightScript::Run(int cmd, uint32_t landings) {
   VehicleBase *vehicle = ctx_->Vehicle();
   if (!vehicle->IsFlightCtrlReady()) return "flightctrl";
@@ -287,6 +328,17 @@ const char *VoiceFlightScript::Run(int cmd, uint32_t landings) {
   return result;
 }
 
+/**
+ * 位置闭环移动: 朝目标偏移量(北/东/上, 米)飞, 到位后刹停悬停。
+ *
+ * 每轮(50ms)检查: 有无新命令抢占 / 控制权是否被抢走 / 遥测是否有效 /
+ * 是否已落地 / 是否仍在位置模式。任一项异常即中止并刹停。
+ * 纯垂直移动时额外监控水平漂移, 超 1m 判 drift 中止。
+ *
+ * 速度按剩余距离比例收敛; 快速爬升段用请求上限而非固定 0.9 增益,
+ * 过冲回修仍用慢速, 避免命令 -5m/s 那样的急降。
+ * passThrough=true 时到位不刹停不停留, 用于两段航路的平滑交接。
+ */
 const char *VoiceFlightScript::Move(const VehicleTelemetry &origin,
                                     double north, double east, double up,
                                     float32_t speed, uint32_t controlLossCount,

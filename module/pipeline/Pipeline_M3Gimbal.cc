@@ -8,6 +8,14 @@ PipelineM3Gimbal::PipelineM3Gimbal(const std::string &cfgPath)
 
 PipelineM3Gimbal::~PipelineM3Gimbal() { DeInit(); }
 
+/**
+ * 按依赖顺序装配整条链路: 配置 -> 硬件 -> 云台 -> 飞控(含航迹存储) ->
+ * 控件 -> 启动 PSDK 应用 -> MOP 服务端。
+ *
+ * 顺序不可调换: 控件回调会投递命令, 必须在云台与飞控就绪后注册;
+ * PSDK 应用必须在所有模块(含控件)注册完成后才能启动。
+ * MOP 初始化失败不阻止启动 —— Pilot 控件仍可用。
+ */
 int64_t PipelineM3Gimbal::Init(void) {
   if (InitConf()) {
     MAICRO_ERROR("init conf error");
@@ -47,6 +55,12 @@ int64_t PipelineM3Gimbal::Init(void) {
   return 0;
 }
 
+/**
+ * 释放整条链路。内存由 unique_ptr 按声明逆序自动回收, 本函数只负责
+ * **必须在析构前显式完成**的事: 停掉会回调进这些对象的线程。
+ * 顺序: 切断命令来源(控件/MOP) -> 停飞控与云台执行线程 -> 释放航迹存储
+ * -> 反初始化硬件。详见函数体内的分步说明与头文件的声明顺序注释。
+ */
 void PipelineM3Gimbal::DeInit(void) {
   // 内存释放已由 unique_ptr 按声明逆序自动完成(见头文件注释)。
   // 这里只做**必须在析构前显式完成**的事: 停掉会回调进这些对象的线程。
@@ -78,6 +92,7 @@ void PipelineM3Gimbal::DeInit(void) {
   conf_.reset();
 }
 
+/// 解析配置文件到 ConfM3Gimbal。失败即中止启动(凭据缺失无法注册 PSDK)。
 int64_t PipelineM3Gimbal::InitConf(void) {
   conf_ = std::make_unique<ConfM3Gimbal>();
   if (conf_->ParseConfFile(cfgPath_)) {
@@ -90,11 +105,16 @@ int64_t PipelineM3Gimbal::InitConf(void) {
   return 0;
 }
 
+/// 创建并初始化硬件抽象层(PSDK 环境/核心/云台/订阅/飞控)。
 int64_t PipelineM3Gimbal::InitVehicle(void) {
   vehicle_ = std::make_unique<VehicleDjiPsdk>();
   return vehicle_->InitVehicleObject(conf_.get());
 }
 
+/**
+ * 创建云台控制器。挂载口取**硬件层的探测结果**而非配置原值:
+ * 配置为 0 表示自动探测, 该原值对云台操作没有意义。
+ */
 int64_t PipelineM3Gimbal::InitGimbal(void) {
   gimbal_ = std::make_unique<GimbalController>();
   // 挂载口取自 vehicle_ 的探测结果而非直接照抄 conf_->gimbalMountPos:
@@ -103,6 +123,13 @@ int64_t PipelineM3Gimbal::InitGimbal(void) {
                        conf_->pitchStep, conf_->rotateTime);
 }
 
+/**
+ * 创建航迹存储与飞控, 并把配置映射为 S_FlightConf。
+ *
+ * 存储先于飞控创建: 飞控与 MOP 服务端都持有它的指针。
+ * 存储初始化失败(目录不可建)不阻止启动 —— 按键仍可用, 航迹命令回 ERROR:io,
+ * 不静默丢数据。云台挂载口同样注入探测结果。
+ */
 int64_t PipelineM3Gimbal::InitFlight(void) {
   S_FlightConf flightConf;
   flightConf.latitude = conf_->targetLatitude;
@@ -142,6 +169,7 @@ int64_t PipelineM3Gimbal::InitFlight(void) {
   return ret;
 }
 
+/// 创建控件处理器并注册按钮回调。必须在云台与飞控就绪之后调用。
 int64_t PipelineM3Gimbal::InitWidget(void) {
   widget_ = std::make_unique<WidgetHandler>();
   return widget_->Init(conf_->widgetCfgDir, gimbal_.get(), flight_.get());

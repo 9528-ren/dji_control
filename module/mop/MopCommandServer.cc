@@ -28,6 +28,11 @@ const uint32_t kSendDrainBatch = 16;
 MopCommandServer::MopCommandServer() {}
 MopCommandServer::~MopCommandServer() { DeInit(); }
 
+/**
+ * 初始化 MOP 命令服务端: 保存三个业务对象指针, 接线航迹事件输出,
+ * 启动 accept 线程。track 可为 nullptr, 此时 TRK 命令统一回 ERROR:nostore。
+ * 事件回调运行在飞行工作线程, 故只做加锁入队, 不做任何阻塞操作。
+ */
 int MopCommandServer::Init(GimbalController *gimbal, FlightController *flight,
                            TrackStore *track) {
   gimbal_ = gimbal;
@@ -47,6 +52,12 @@ int MopCommandServer::Init(GimbalController *gimbal, FlightController *flight,
   return 0;
 }
 
+/**
+ * 建立监听通道并进入 accept 循环(运行在独立线程)。
+ * MOP 模块初始化可能晚于本线程启动, 故最多重试 5 次、每次间隔 2s。
+ * 通道创建后 Bind 到 CHANNEL_ID, 随后循环 Accept。
+ * 注: PSDK 3.17 无 Listen 接口, Bind 后直接 Accept 即为正确序列。
+ */
 void MopCommandServer::InitAndAccept(void) {
   int initTries = 0;
   while (running_ && initTries < 5) {
@@ -85,6 +96,10 @@ void MopCommandServer::InitAndAccept(void) {
   }
 }
 
+/**
+ * 停止服务: 置运行标志为 false, 关闭并销毁监听通道, 等 accept 线程退出。
+ * 必须在释放 flight_/gimbal_/track_ 之前调用, 否则收包线程可能访问已析构对象。
+ */
 void MopCommandServer::DeInit(void) {
   running_ = false;
   if (listenCn_) {
@@ -97,6 +112,11 @@ void MopCommandServer::DeInit(void) {
   }
 }
 
+/**
+ * accept 循环: 每 500ms 尝试接受一个客户端连接。
+ * 接受成功即为该客户端起一个 detached 收包线程(HandleClient)。
+ * 支持多客户端各自独立会话。
+ */
 void MopCommandServer::AcceptLoop(void) {
   while (running_) {
     T_DjiMopChannelHandle clientCn = nullptr;
@@ -110,6 +130,13 @@ void MopCommandServer::AcceptLoop(void) {
   }
 }
 
+/**
+ * 单个客户端的收包循环(每客户端一个线程)。
+ *
+ * 按字节累积到缓冲区, **凑齐整行('\n')才解码**, 避免跨包汉字被截断损坏。
+ * 每行交 DispatchCommand 处理。同时启动 SendLoop 线程负责回包与心跳。
+ * 连续超时/错误达阈值才判链路断开, 单次超时不判死(实测对端仍活)。
+ */
 void MopCommandServer::HandleClient(T_DjiMopChannelHandle clientCn) {
   char recvBuf[1024];
   uint32_t realLen = 0;
@@ -196,6 +223,14 @@ void MopCommandServer::HandleClient(T_DjiMopChannelHandle clientCn) {
   MAICRO_INFO("mop cmd server: handler exit");
 }
 
+/**
+ * 发送线程: 排空发送队列并按周期下发心跳("HB\n")。
+ *
+ * **独立线程而非在收包线程里发**: 早期版本共用一个线程时,
+ * 一次 SendData 阻塞会把收包也卡住, 表现为指令延迟累积。
+ * 心跳周期须与 App 侧看门狗阈值匹配, 否则 App 会误判链路中断。
+ * 发送耗时超 10ms 或非心跳包都记日志, 便于定位链路抖动。
+ */
 void MopCommandServer::SendLoop(T_DjiMopChannelHandle clientCn,
                                 std::atomic<bool> *alive) {
   int hbCount = 0;
@@ -266,6 +301,10 @@ void MopCommandServer::SendLoop(T_DjiMopChannelHandle clientCn,
   }
 }
 
+/**
+ * 把一行响应放入发送队列(线程安全)。队列满则丢弃并告警 ——
+ * 宁可丢一条回包, 也不让队列无界增长吃掉内存。
+ */
 void MopCommandServer::QueueResponse(const std::string &resp) {
   std::lock_guard<std::mutex> lk(sendMutex_);
   if (sendQueue_.size() >= kMaxSendQueue) {
@@ -276,6 +315,11 @@ void MopCommandServer::QueueResponse(const std::string &resp) {
   sendCond_.notify_one();
 }
 
+/**
+ * 把一行主动事件放入发送队列(线程安全)。与响应同一队列。
+ * **不校验 running_**: 航迹事件可能在 DeInit 竞态窗口内产生,
+ * 此时入队无害 —— 连接关闭时队列会被清空, 不会串到下一个客户端。
+ */
 void MopCommandServer::QueueEvent(const std::string &line) {
   // 与 QueueResponse 同一队列。不校验 running_: 航迹事件可能在 DeInit
   // 竞态窗口内 产生, 此时入队无害(连接关闭时队列会被清空,
@@ -289,6 +333,14 @@ void MopCommandServer::QueueEvent(const std::string &line) {
   sendCond_.notify_one();
 }
 
+/**
+ * 指令分发。三条独立协议互不干扰:
+ *   TRK,...  航迹与语音脚本(独立 rid 与聚合语义)
+ *   UPG,...  分片自升级(独立响应前缀)
+ *   其余     12 条飞行/云台指令, 查 CommandTable 分派, 回 OK / ERROR:unknown
+ * 飞行指令的 ACK 语义(只认 OK/ERROR: 前缀、发送前清队列、严禁重发)保持不变。
+ * UPG,DATA 分片不逐条打日志, 否则会刷满日志。
+ */
 void MopCommandServer::DispatchCommand(const std::string &cmd) {
   if (cmd.compare(0, 9, "UPG,DATA,") != 0) {
     MAICRO_INFO("mop cmd: %s", cmd.c_str());
@@ -703,6 +755,7 @@ std::string ToLowerHex(std::string s) {
 
 } // namespace
 
+/// 关闭升级暂存文件: 先 fsync 再 close, 保证已收分片落盘。幂等。
 void MopCommandServer::CloseUpgradeFile() {
   if (upgFd_ >= 0) {
     fsync(upgFd_);
@@ -711,6 +764,15 @@ void MopCommandServer::CloseUpgradeFile() {
   }
 }
 
+/**
+ * 处理分片自升级命令族。
+ *   UPG,INFO           查询当前程序 md5 与大小
+ *   UPG,BEGIN,size,md5,chunk  开暂存文件, 记录期望校验值与分片位图
+ *   UPG,DATA,seq,<hex> 写入指定分片(按位图去重, 支持乱序与重传)
+ *   UPG,END            校验完整文件 MD5, 通过则落成 pending, 下次启动生效
+ *   UPG,ABORT          丢弃暂存
+ * 只有 MD5 完全一致才落 pending, 避免半截文件把程序弄坏。
+ */
 void MopCommandServer::HandleUpgradeCommand(const std::string &cmd) {
   std::vector<std::string> f = SplitComma(cmd);
   std::string verb = f.size() > 1 ? f[1] : "";
